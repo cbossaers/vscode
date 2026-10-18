@@ -262,6 +262,16 @@ jobs:
             need_task core-ci-pr core-ci
             need_task compile-extensions-build
           fi
+
+          # Newer VS Code bundles Copilot Chat as a built-in extension (extensions/copilot).
+          # Packaging expects its SDK folder (.build/extensions/copilot/node_modules/@github/copilot/sdk),
+          # which CI normally gets from a pre-built VSIX. For non-CI builds upstream provides this task.
+          # It must run AFTER compile-extensions-build (which wipes .build/extensions) and BEFORE packaging.
+          # (AI features are still switched off by default via chat.disableAIFeatures.)
+          opt_task compile-copilot-extension-build
+          echo "Copilot extension build output:"
+          ls -la .build/extensions/copilot/node_modules/@github/copilot 2>&1 | head -n 15 || true
+
           need_task "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci" "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min"
 
       - name: Verify the built product.json contains our customisations
