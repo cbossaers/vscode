@@ -1,4 +1,3 @@
-
 name: Build Privacy-Hardened Code - OSS
 
 on:
@@ -7,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: Rebuild even if the release was already built
+        description: Rebuild and refresh the release even if this upstream tag was already built
         type: boolean
         default: false
         required: false
@@ -29,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check latest stable release
+      - name: Check latest stable upstream release
         id: release
         shell: bash
         env:
@@ -41,13 +40,11 @@ jobs:
           TAG=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/microsoft/vscode/releases?per_page=100" \
-            | jq -er \
-              '[.[] | select(.draft == false and .prerelease == false)]
-               | .[0].tag_name // empty')
+            "https://api.github.com/repos/microsoft/vscode/releases/latest" \
+            | jq -er '.tag_name // empty')
 
           test -n "$TAG" || {
-            echo "No stable release found"
+            echo "No stable upstream release found" >&2
             exit 1
           }
 
@@ -64,36 +61,8 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-  catalogue:
-    needs: check
-    if: needs.check.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Fetch and validate the BYOK model catalogue
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --location --retry 3 \
-            "https://main.vscode-cdn.net/extensions/copilotChat.json" \
-            --output copilotChat.json
-
-          jq -e '(.version == 1) and (.modelInfo | type == "object")' \
-            copilotChat.json >/dev/null
-
-          echo "Downloaded and validated BYOK model catalogue."
-          sha256sum copilotChat.json
-
-      - name: Upload validated catalogue
-        uses: actions/upload-artifact@v7
-        with:
-          name: byok-known-model-catalogue-${{ needs.check.outputs.tag }}
-          path: copilotChat.json
-          if-no-files-found: error
-          retention-days: 7
-
   build:
-    needs: [check, catalogue]
+    needs: check
     if: needs.check.outputs.changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
@@ -102,22 +71,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # One build per platform; Chat/BYOK stays bundled, with AI features off by default.
           - os: ubuntu-26.04
-            cache_os: linux
             platform: linux-x64
-            task: vscode-linux-x64-min
-            output: VSCode-linux-x64
-            archive: code-oss-linux-x64.tar.gz
-            installer: code-oss-linux-x64.deb
-
           - os: windows-2022
-            cache_os: windows
             platform: windows-x64
-            task: vscode-win32-x64-min
-            output: VSCode-win32-x64
-            archive: code-oss-windows-x64.zip
-            installer: code-oss-windows-x64-setup.exe
 
     steps:
       - name: Checkout upstream release
@@ -135,593 +92,262 @@ jobs:
           cache: npm
           cache-dependency-path: vscode/package-lock.json
 
-      - name: Install Linux dependencies
+      - name: Install Linux build and package dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential g++ libx11-dev \
-            libxkbfile-dev libsecret-1-dev \
-            libkrb5-dev python-is-python3 pkg-config fakeroot rpm
+            build-essential g++ libx11-dev libxkbfile-dev \
+            libsecret-1-dev libkrb5-dev python-is-python3 pkg-config \
+            fakeroot rpm
 
-      - name: Install Windows build tools
+      - name: Set up Windows build tools
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v2
 
-      - name: Locate Windows SDK SignTool
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
-
-          $tool = if (Test-Path $kits) {
-            Get-ChildItem $kits -Filter signtool.exe -Recurse -File |
-              Where-Object {
-                $_.FullName -match '\\x64\\signtool\.exe$'
-              } |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-          }
-
-          if (-not $tool) {
-            throw "SignTool is not installed on this runner."
-          }
-
-          $tool.DirectoryName |
-            Out-File $env:GITHUB_PATH -Append -Encoding utf8
-
-      - name: Disable Copilot shim in build task
+      # Code - OSS does not expose a supported product.json field for arbitrary
+      # configuration defaults. A tiny built-in extension contributes the defaults
+      # so they are included in the Linux and Windows packages alike.
+      - name: Configure Open VSX and add privacy defaults
         working-directory: vscode
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $file = "build/gulpfile.vscode.ts"
-          $source = Get-Content $file -Raw
 
-          $pattern = '(?s)function prepareCopilotRipgrepShimTask\s*\([^)]*\)\s*\{.*?^\}'
-
-          if (-not [regex]::IsMatch(
-            $source,
-            $pattern,
-            [System.Text.RegularExpressions.RegexOptions]::Multiline
-          )) {
-            throw "Could not find prepareCopilotRipgrepShimTask. Upstream source changed."
+          $productPath = Join-Path $PWD "product.json"
+          if (-not (Test-Path $productPath -PathType Leaf)) {
+            throw "product.json was not found."
           }
 
-          $replacement = @'
-          function prepareCopilotRipgrepShimTask(_platform: string, _arch: string, _destinationFolderName: string) {
-            return () => {
-              console.log('Skipping Copilot ripgrep shim for privacy-focused build.');
-            };
+          $product = Get-Content $productPath -Raw | ConvertFrom-Json -AsHashtable
+
+          # The settings default is also contributed by the built-in extension below.
+          # These product-level switches additionally disable telemetry collection.
+          $product["enableTelemetry"] = $false
+          $product["enabledTelemetryLevels"] = @{
+            error = $false
+            usage = $false
           }
-          '@
 
-          $source = [regex]::Replace(
-            $source,
-            $pattern,
-            $replacement,
-            [System.Text.RegularExpressions.RegexOptions]::Multiline
-          )
-
-          Set-Content $file -Value $source -Encoding utf8
-
-      # Reuse the dependency cache strategy and archive scripts from the
-      # checked-out upstream tag. Its key includes package manifests/lockfiles,
-      # npm configuration, cache salt, platform/architecture, and Node version.
-      - name: Prepare node_modules cache key
-        id: node-modules-key
-        working-directory: vscode
-        shell: pwsh
-        env:
-          CACHE_OS: ${{ matrix.cache_os }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force .build | Out-Null
-          $architecture = node -p process.arch
-          $lockHash = node build/azure-pipelines/common/computeNodeModulesCacheKey.ts $env:CACHE_OS x64 $architecture
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($lockHash)) {
-            throw "Failed to calculate the upstream node_modules cache key."
+          $product["extensionsGallery"] = @{
+            serviceUrl = "https://open-vsx.org/vscode/gallery"
+            itemUrl = "https://open-vsx.org/vscode/item"
+            resourceUrlTemplate = "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"
+            extensionUrlTemplate = "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest"
           }
-          $nodeVersion = node -p process.version
-          "key=node_modules-$env:CACHE_OS-$($lockHash.Trim())-node-$nodeVersion" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $product["linkProtectionTrustedDomains"] = @("https://open-vsx.org")
 
-      - name: Restore node_modules cache
-        id: node-modules-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: vscode/.build/node_modules_cache
-          key: ${{ steps.node-modules-key.outputs.key }}
+          $product | ConvertTo-Json -Depth 100 | Set-Content $productPath -Encoding utf8
 
-      - name: Extract node_modules cache
-        if: steps.node-modules-cache.outputs.cache-hit == 'true'
-        working-directory: vscode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ($IsWindows) {
-            & ./.github/workflows/node_modules_cache/cache.ps1 extract
-            if (-not $?) { throw "Failed to extract the node_modules cache." }
-          } else {
-            bash ./.github/workflows/node_modules_cache/cache.sh extract
-            if ($LASTEXITCODE -ne 0) { throw "Failed to extract the node_modules cache." }
+          $extensionDir = Join-Path $PWD "extensions/privacy-defaults"
+          New-Item -ItemType Directory -Path $extensionDir -Force | Out-Null
+
+          $defaults = @{
+            "extensions.autoCheckUpdates" = $false
+            "extensions.autoUpdate" = $false
+            "update.mode" = "none"
+            "update.showReleaseNotes" = $false
+            "telemetry.telemetryLevel" = "off"
+            "chat.disableAIFeatures" = $true
+          }
+
+          $manifest = @{
+            name = "privacy-defaults"
+            publisher = "privacy-build"
+            displayName = "Privacy Defaults"
+            description = "Default settings for the privacy-hardened Code - OSS build."
+            version = "1.0.0"
+            engines = @{ vscode = "^1.50.0" }
+            contributes = @{ configurationDefaults = $defaults }
+          }
+
+          $manifestPath = Join-Path $extensionDir "package.json"
+          $manifest | ConvertTo-Json -Depth 20 | Set-Content $manifestPath -Encoding utf8
+
+          # Fail early if the marketplace or defaults were not written as expected.
+          $checkProduct = Get-Content $productPath -Raw | ConvertFrom-Json
+          if ($checkProduct.extensionsGallery.serviceUrl -ne "https://open-vsx.org/vscode/gallery") {
+            throw "Open VSX configuration was not written correctly."
+          }
+          $checkManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($checkManifest.contributes.configurationDefaults.'telemetry.telemetryLevel' -ne "off") {
+            throw "Privacy defaults extension manifest was not written correctly."
           }
 
       - name: Install npm dependencies
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
         working-directory: vscode
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm install
 
-      - name: Archive and save node_modules cache
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
-        working-directory: vscode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ($IsWindows) {
-            & ./.github/workflows/node_modules_cache/cache.ps1 archive
-            if (-not $?) { throw "Failed to archive the node_modules cache." }
-          } else {
-            bash ./.github/workflows/node_modules_cache/cache.sh archive
-            if ($LASTEXITCODE -ne 0) { throw "Failed to archive the node_modules cache." }
-          }
-
-      - name: Save node_modules cache
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: vscode/.build/node_modules_cache
-          key: ${{ steps.node-modules-key.outputs.key }}
-
-      - name: Download validated BYOK catalogue
-        uses: actions/download-artifact@v7
-        with:
-          name: byok-known-model-catalogue-${{ needs.check.outputs.tag }}
-          path: byok-catalogue
-
-      - name: Embed BYOK catalogue and remove its runtime network request
+      - name: Build Linux archive, Debian package, and RPM package
+        if: matrix.platform == 'linux-x64'
         working-directory: vscode
         shell: bash
         run: |
           set -euo pipefail
-          node <<'NODE'
-          const fs = require('node:fs');
-          const path = require('node:path');
+          export NODE_ENV=production
 
-          const cataloguePath = path.resolve('../byok-catalogue/copilotChat.json');
-          const catalogue = JSON.parse(fs.readFileSync(cataloguePath, 'utf8'));
-          if (catalogue.version !== 1 || !catalogue.modelInfo || typeof catalogue.modelInfo !== 'object') {
-            throw new Error('The downloaded BYOK catalogue has an unexpected format.');
-          }
-
-          const modulePath = path.join(
-            'extensions/copilot/src/extension/byok/vscode-node',
-            'byokKnownModels.generated.ts'
-          );
-          const generated = [
-            '/* Generated by the Code - OSS build workflow. Do not edit manually. */',
-            `export const LOCAL_BYOK_KNOWN_MODELS: unknown = JSON.parse(${JSON.stringify(JSON.stringify(catalogue))});`,
-            ''
-          ].join('\n');
-          fs.writeFileSync(modulePath, generated, 'utf8');
-
-          const sourcePath = 'extensions/copilot/src/extension/byok/vscode-node/byokContribution.ts';
-          let source = fs.readFileSync(sourcePath, 'utf8');
-          const providerImport = "import { BYOKKnownModels, isClientBYOKAllowed } from '../../byok/common/byokProvider';";
-          if (source.split(providerImport).length !== 2) {
-            throw new Error('Could not find exactly one BYOK provider import; upstream source changed.');
-          }
-          source = source.replace(
-            providerImport,
-            providerImport + "\nimport { LOCAL_BYOK_KNOWN_MODELS } from './byokKnownModels.generated';"
-          );
-
-          const methodSignature = 'private async _fetchKnownModelList(fetcherService: IFetcherService): Promise<Record<string, BYOKKnownModels>> {';
-          if (source.split(methodSignature).length !== 2) {
-            throw new Error('Could not find exactly one BYOK model-list method signature; upstream source changed.');
-          }
-          source = source.replace(
-            methodSignature,
-            'private async _fetchKnownModelList(_fetcherService: IFetcherService): Promise<Record<string, BYOKKnownModels>> {'
-          );
-
-          const fetchStatement = "const data = await (await fetcherService.fetch('https://main.vscode-cdn.net/extensions/copilotChat.json', { method: 'GET', callSite: 'byok-known-models' })).json();";
-          if (source.split(fetchStatement).length !== 2) {
-            throw new Error('Could not find exactly one runtime catalogue fetch; upstream source changed.');
-          }
-          source = source.replace(
-            fetchStatement,
-            'const data = LOCAL_BYOK_KNOWN_MODELS as { version: number; modelInfo: Record<string, BYOKKnownModels> };'
-          );
-          source = source.replace(
-            "this._logService.info('BYOK: fetching known models list');",
-            "this._logService.info('BYOK: loading bundled known models list');"
-          );
-          source = source.replace(
-            "this._logService.info('BYOK: Copilot Chat known models list fetched successfully.');",
-            "this._logService.info('BYOK: bundled Copilot Chat known models list loaded successfully.');"
-          );
-
-          fs.writeFileSync(sourcePath, source, 'utf8');
-          console.log(`Embedded catalogue and patched ${sourcePath}.`);
-          NODE
-
-      - name: Configure product defaults and Open VSX
-        working-directory: vscode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $file = "product.json"
-          if (-not (Test-Path $file -PathType Leaf)) { throw "product.json not found." }
-
-          $product = Get-Content $file -Raw | ConvertFrom-Json
-          $product | Add-Member -NotePropertyName enableTelemetry -NotePropertyValue $false -Force
-          $product | Add-Member -NotePropertyName builtInExtensionsEnabledWithAutoUpdates -NotePropertyValue @() -Force
-          $product | Add-Member -NotePropertyName enabledTelemetryLevels -NotePropertyValue ([pscustomobject]@{ error = $false; usage = $false }) -Force
-
-          if (-not $product.extensionsGallery) {
-            $product | Add-Member -NotePropertyName extensionsGallery -NotePropertyValue ([pscustomobject]@{}) -Force
-          }
-          $gallery = $product.extensionsGallery
-          $gallery | Add-Member -NotePropertyName serviceUrl -NotePropertyValue "https://open-vsx.org/vscode/gallery" -Force
-          $gallery | Add-Member -NotePropertyName itemUrl -NotePropertyValue "https://open-vsx.org/vscode/item" -Force
-          $gallery | Add-Member -NotePropertyName resourceUrlTemplate -NotePropertyValue "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}" -Force
-          $gallery | Add-Member -NotePropertyName extensionUrlTemplate -NotePropertyValue "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest" -Force
-
-          $trustedDomains = @($product.linkProtectionTrustedDomains | Where-Object { $_ })
-          if ($trustedDomains -notcontains "https://open-vsx.org") { $trustedDomains += "https://open-vsx.org" }
-          $product | Add-Member -NotePropertyName linkProtectionTrustedDomains -NotePropertyValue $trustedDomains -Force
-
-          $product | ConvertTo-Json -Depth 100 | Set-Content $file -Encoding utf8
-
-      - name: Set privacy-preserving configuration defaults
-        working-directory: vscode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          function Replace-ExactlyOnce {
-            param(
-              [Parameter(Mandatory = $true)][string]$File,
-              [Parameter(Mandatory = $true)][string]$Pattern,
-              [Parameter(Mandatory = $true)][string]$Replacement
-            )
-
-            if (-not (Test-Path $File -PathType Leaf)) {
-              throw "Expected upstream source file not found: $File"
-            }
-
-            $source = [System.IO.File]::ReadAllText($File)
-            $regex = [regex]::new($Pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
-            $matches = $regex.Matches($source)
-            if ($matches.Count -ne 1) {
-              throw "Expected exactly one setting default match in $File but found $($matches.Count). Upstream source may have changed."
-            }
-
-            $source = $regex.Replace($source, $Replacement, 1)
-            [System.IO.File]::WriteAllText($File, $source, [System.Text.UTF8Encoding]::new($false))
-            Write-Host "Patched default in $File"
-          }
-
-          Replace-ExactlyOnce `
-            "src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts" `
-            "('extensions\.autoUpdate'\s*:\s*\{.*?\bdefault:\s*)'on'" `
-            ('$1' + "'off'")
-
-          Replace-ExactlyOnce `
-            "src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts" `
-            "('extensions\.autoCheckUpdates'\s*:\s*\{.*?\bdefault:\s*)true" `
-            '$1false'
-
-          Replace-ExactlyOnce `
-            "src/vs/platform/update/common/update.config.contribution.ts" `
-            "('update\.mode'\s*:\s*\{.*?\bdefault:\s*)'default'" `
-            ('$1' + "'none'")
-
-          Replace-ExactlyOnce `
-            "src/vs/platform/update/common/update.config.contribution.ts" `
-            "('update\.showReleaseNotes'\s*:\s*\{.*?\bdefault:\s*)true" `
-            '$1false'
-
-          Replace-ExactlyOnce `
-            "src/vs/platform/telemetry/common/telemetryService.ts" `
-            "(\[TELEMETRY_SETTING_ID\]\s*:\s*\{.*?'default'\s*:\s*)TelemetryConfiguration\.ON" `
-            '$1TelemetryConfiguration.OFF'
-
-          Replace-ExactlyOnce `
-            "src/vs/platform/telemetry/common/telemetryService.ts" `
-            "(\[TELEMETRY_OLD_SETTING_ID\]\s*:\s*\{.*?'default'\s*:\s*)true" `
-            '$1false'
-
-      - name: Set Chat Disable AI Features setting default to true
-        working-directory: vscode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # Change the registered configuration-schema default, not a sample
-          # settings file. Fresh profiles start with AI hidden; users can set
-          # chat.disableAIFeatures to false later if they choose.
-          $patterns = @(
-            '(?s)(\[\s*ChatAIDisabledSettingId\s*\]\s*:\s*\{(?:(?!\r?\n[ \t]*\},).){0,2500}?\bdefault\s*:\s*)(?:false|true)',
-            '(?s)([''\"]chat\.disableAIFeatures[''\"]\s*:\s*\{(?:(?!\r?\n[ \t]*\},).){0,2500}?\bdefault\s*:\s*)(?:false|true)'
-          )
-          $hits = @()
-          foreach ($file in (Get-ChildItem "src/vs" -Recurse -File -Filter "*.ts")) {
-            $source = [System.IO.File]::ReadAllText($file.FullName)
-            foreach ($pattern in $patterns) {
-              foreach ($match in [regex]::Matches($source, $pattern)) {
-                $hits += [pscustomobject]@{ Path = $file.FullName; Source = $source; Pattern = $pattern }
-              }
-            }
-          }
-
-          if ($hits.Count -ne 1) {
-            throw "Expected exactly one chat.disableAIFeatures schema default in src/vs, found $($hits.Count). Upstream source may have moved; refusing to build with AI enabled by default."
-          }
-
-          $hit = $hits[0]
-          $settingRegex = [regex]::new($hit.Pattern)
-          $updated = $settingRegex.Replace($hit.Source, '$1true', 1)
-          if ($updated -ne $hit.Source) {
-            [System.IO.File]::WriteAllText($hit.Path, $updated, [System.Text.UTF8Encoding]::new($false))
-            Write-Host "Set chat.disableAIFeatures default to true in $($hit.Path)."
-          } else {
-            Write-Host "chat.disableAIFeatures already defaults to true in $($hit.Path)."
-          }
-
-      - name: Build application
-        working-directory: vscode
-        env:
-          NODE_ENV: production
-          GITHUB_TOKEN: ${{ github.token }}
-        run: npm run gulp ${{ matrix.task }}
-
-      - name: Resolve build output directory
-        id: package
-        shell: pwsh
-        env:
-          OUTPUT_DIR: ${{ matrix.output }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $package = @("$PWD/$env:OUTPUT_DIR", "$PWD/vscode/$env:OUTPUT_DIR") |
-            Where-Object { Test-Path $_ -PathType Container } |
-            Select-Object -First 1
-          if (-not $package) { throw "Build output '$env:OUTPUT_DIR' not found." }
-          "path=$((Resolve-Path $package).Path)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Verify bundled Chat extension is retained
-        shell: pwsh
-        env:
-          PACKAGE_DIR: ${{ steps.package.outputs.path }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $manifestPath = Join-Path $env:PACKAGE_DIR "resources/app/extensions/copilot/package.json"
-
-          if (-not (Test-Path $manifestPath -PathType Leaf)) {
-            throw "Bundled Chat extension manifest was not found at '$manifestPath'."
-          }
-
-          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-          if ($manifest.publisher -ne "GitHub" -or $manifest.name -ne "copilot-chat") {
-            throw "Unexpected Chat extension manifest at '$manifestPath'."
-          }
-
-          $productPath = Join-Path $env:PACKAGE_DIR "resources/app/product.json"
-          $product = Get-Content $productPath -Raw | ConvertFrom-Json
-          if (-not $product.defaultChatAgent) {
-            throw "Standard edition is missing defaultChatAgent product metadata."
-          }
-
-          $compiledFiles = Get-ChildItem (Join-Path $env:PACKAGE_DIR "resources/app/extensions/copilot") -Recurse -File |
-            Where-Object { $_.Extension -in @(".js", ".mjs", ".cjs") }
-          foreach ($file in $compiledFiles) {
-            if (Select-String -Path $file.FullName -SimpleMatch "https://main.vscode-cdn.net/extensions/copilotChat.json" -Quiet) {
-              throw "Runtime Microsoft model-catalogue URL remains in packaged file '$($file.FullName)'."
-            }
-          }
-
-          Write-Host "Standard edition retains bundled Chat/BYOK and loads the known-model catalogue locally."
-
-      - name: Build Linux Debian installer
-        if: runner.os == 'Linux'
-        working-directory: vscode
-        shell: bash
-        env:
-          INSTALLER_PATH: ${{ github.workspace }}/${{ matrix.installer }}
-        run: |
-          set -euo pipefail
-
-          # Upstream provides native Debian packaging tasks. The prepare task
-          # assembles the package tree; build-deb turns it into a .deb installer.
-          npm run gulp vscode-linux-x64-prepare-deb
+          npm run gulp vscode-linux-x64-min
           npm run gulp vscode-linux-x64-build-deb
-
-          mapfile -t packages < <(find .build/linux/deb/amd64/deb -maxdepth 1 -type f -name '*.deb' -print)
-          if [ "${#packages[@]}" -ne 1 ]; then
-            printf 'Expected exactly one Debian package, found %s\n' "${#packages[@]}" >&2
-            printf '%s\n' "${packages[@]}" >&2
-            exit 1
-          fi
-
-          cp "${packages[0]}" "$INSTALLER_PATH"
-          test -s "$INSTALLER_PATH"
-          file "$INSTALLER_PATH"
-
-      - name: Build Linux RPM installer (Fedora and RPM-based distributions)
-        if: runner.os == 'Linux'
-        working-directory: vscode
-        shell: bash
-        env:
-          INSTALLER_PATH: ${{ github.workspace }}/code-oss-linux-x64.rpm
-        run: |
-          set -euo pipefail
-
-          # Use upstream's RPM packaging tasks; the editor is compiled only once.
-          npm run gulp vscode-linux-x64-prepare-rpm
           npm run gulp vscode-linux-x64-build-rpm
 
-          mapfile -t packages < <(find .build/linux/rpm -type f -name '*.rpm' -print)
-          if [ "${#packages[@]}" -ne 1 ]; then
-            printf 'Expected exactly one RPM package, found %s\n' "${#packages[@]}" >&2
-            printf '%s\n' "${packages[@]}" >&2
+          # The packaged application directory is one level above the source checkout.
+          tar -czf ../code-oss-linux-x64.tar.gz -C .. VSCode-linux-x64
+
+          DEB=$(find .build/linux/deb -type f -name '*.deb' -print -quit || true)
+          RPM=$(find .build/linux/rpm -type f -name '*.rpm' -print -quit || true)
+          test -n "$DEB" && test -s "$DEB" || {
+            echo "No Debian package was generated under vscode/.build/linux/deb" >&2
             exit 1
-          fi
+          }
+          test -n "$RPM" && test -s "$RPM" || {
+            echo "No RPM package was generated under vscode/.build/linux/rpm" >&2
+            exit 1
+          }
 
-          cp "${packages[0]}" "$INSTALLER_PATH"
-          test -s "$INSTALLER_PATH"
-          rpm --query --package "$INSTALLER_PATH"
-          echo "Created Fedora/RPM installer: $INSTALLER_PATH"
+          cp "$DEB" ../code-oss-linux-x64.deb
+          cp "$RPM" ../code-oss-linux-x64.rpm
+          ls -lh ../code-oss-linux-x64.tar.gz ../code-oss-linux-x64.deb ../code-oss-linux-x64.rpm
 
-      - name: Build Windows user installer
-        if: runner.os == 'Windows'
+      - name: Build Windows portable archive and installer
+        if: matrix.platform == 'windows-x64'
         working-directory: vscode
         shell: pwsh
-        env:
-          INSTALLER_PATH: ${{ github.workspace }}\${{ matrix.installer }}
         run: |
           $ErrorActionPreference = "Stop"
+          $env:NODE_ENV = "production"
 
-          # Use upstream's Inno Setup task so install/uninstall, shortcuts,
-          # file associations, and product-specific paths follow VS Code's packaging.
+          npm run gulp vscode-win32-x64-min
+          if ($LASTEXITCODE -ne 0) { throw "Windows application build failed." }
+
+          npm run gulp vscode-win32-x64-inno-updater
+          if ($LASTEXITCODE -ne 0) { throw "Windows Inno Setup updater preparation failed." }
+
           npm run gulp vscode-win32-x64-user-setup
-          if ($LASTEXITCODE -ne 0) { throw "Upstream Windows user installer task failed." }
+          if ($LASTEXITCODE -ne 0) { throw "Windows user installer build failed." }
 
-          $setupDir = Join-Path $PWD ".build/win32-x64/user-setup"
-          $setups = @(Get-ChildItem $setupDir -File -Filter "*.exe")
-          if ($setups.Count -ne 1) {
-            throw "Expected exactly one Windows setup executable in '$setupDir'; found $($setups.Count)."
+          $workspace = $env:GITHUB_WORKSPACE
+          $packageDir = Join-Path $workspace "VSCode-win32-x64"
+          if (-not (Test-Path $packageDir -PathType Container)) {
+            throw "Windows application output was not found at $packageDir"
           }
 
-          Copy-Item -LiteralPath $setups[0].FullName -Destination $env:INSTALLER_PATH -Force
-          if (-not (Test-Path $env:INSTALLER_PATH -PathType Leaf) -or (Get-Item $env:INSTALLER_PATH).Length -eq 0) {
-            throw "Windows installer was not created: $env:INSTALLER_PATH"
-          }
-          Write-Host "Created installer: $env:INSTALLER_PATH"
+          $zipPath = Join-Path $workspace "code-oss-windows-x64.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal
 
-      - name: Archive platform build
-        shell: pwsh
-        env:
-          PACKAGE_DIR: ${{ steps.package.outputs.path }}
-          ARCHIVE: ${{ matrix.archive }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          if (-not (Test-Path $env:PACKAGE_DIR -PathType Container)) {
-            throw "Build output directory not found: $env:PACKAGE_DIR"
+          $setupDir = Join-Path $PWD ".build\win32-x64\user-setup"
+          if (-not (Test-Path $setupDir -PathType Container)) {
+            throw "Windows installer output directory was not found at $setupDir"
           }
-          if (Test-Path $env:ARCHIVE) { Remove-Item $env:ARCHIVE -Force }
+          $installers = @(Get-ChildItem $setupDir -Filter "*.exe" -File)
+          if ($installers.Count -eq 0) {
+            throw "No Windows installer executable was generated in $setupDir"
+          }
 
-          if ($IsWindows) {
-            Compress-Archive -Path $env:PACKAGE_DIR -DestinationPath $env:ARCHIVE -CompressionLevel Optimal
-          } else {
-            $parent = Split-Path -Parent $env:PACKAGE_DIR
-            $name = Split-Path -Leaf $env:PACKAGE_DIR
-            tar -czf $env:ARCHIVE -C $parent $name
-            if ($LASTEXITCODE -ne 0) { throw "tar failed to create archive." }
-          }
-          if (-not (Test-Path $env:ARCHIVE -PathType Leaf) -or (Get-Item $env:ARCHIVE).Length -eq 0) {
-            throw "Archive was not created or is empty: $env:ARCHIVE"
-          }
-          Write-Host "Created archive: $env:ARCHIVE"
+          $installerPath = Join-Path $workspace "code-oss-windows-x64-setup.exe"
+          Copy-Item $installers[0].FullName $installerPath -Force
+          Get-Item $zipPath, $installerPath | Select-Object Name, Length
 
-      - name: Upload platform archive
+      - name: Upload Linux packages
+        if: matrix.platform == 'linux-x64'
         uses: actions/upload-artifact@v7
         with:
           name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
           path: |
-            ${{ matrix.archive }}
-            ${{ matrix.installer }}
+            code-oss-linux-x64.tar.gz
+            code-oss-linux-x64.deb
+            code-oss-linux-x64.rpm
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Linux RPM installer
-        if: runner.os == 'Linux'
+      - name: Upload Windows installer and portable archive
+        if: matrix.platform == 'windows-x64'
         uses: actions/upload-artifact@v7
         with:
-          name: code-oss-linux-rpm-${{ needs.check.outputs.tag }}
-          path: code-oss-linux-x64.rpm
+          name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
+          path: |
+            code-oss-windows-x64.zip
+            code-oss-windows-x64-setup.exe
           if-no-files-found: error
           retention-days: 30
 
   release:
     needs: [check, build]
-    if: needs.check.outputs.changed == 'true' && needs.build.result == 'success'
+    if: needs.check.outputs.changed == 'true'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download platform build artifacts
+      - uses: actions/checkout@v7
+
+      - name: Download all build assets
         uses: actions/download-artifact@v7
         with:
           pattern: code-oss-*-${{ needs.check.outputs.tag }}
           path: release-assets
           merge-multiple: true
 
-      - name: Verify archives and generate checksums
+      - name: Create or refresh GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          test -s release-assets/code-oss-linux-x64.tar.gz
-          test -s release-assets/code-oss-linux-x64.deb
-          test -s release-assets/code-oss-linux-x64.rpm
-          test -s release-assets/code-oss-windows-x64.zip
-          test -s release-assets/code-oss-windows-x64-setup.exe
-          sha256sum \
-            release-assets/code-oss-linux-x64.tar.gz \
-            release-assets/code-oss-linux-x64.deb \
-            release-assets/code-oss-linux-x64.rpm \
-            release-assets/code-oss-windows-x64.zip \
-            release-assets/code-oss-windows-x64-setup.exe \
-            > release-assets/SHA256SUMS
-          cat release-assets/SHA256SUMS
+          shopt -s nullglob
 
-      - name: Create or update GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.check.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: Code - OSS ${{ needs.check.outputs.tag }}
-          body: |
-            Privacy-hardened Code - OSS builds from the Microsoft VS Code upstream release `${{ needs.check.outputs.tag }}`.
+          assets=(release-assets/*)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No build assets were downloaded." >&2
+            exit 1
+          fi
 
-            Upstream source: https://github.com/microsoft/vscode/releases/tag/${{ needs.check.outputs.tag }}
+          title="Code - OSS ${UPSTREAM_TAG} (Open VSX, privacy defaults)"
+          notes=$(cat <<EOF
+          Privacy-hardened Code - OSS build from upstream Microsoft VS Code tag ${UPSTREAM_TAG}.
 
-            Downloads:
-            - Linux x64 portable archive: `code-oss-linux-x64.tar.gz`
-            - Linux x64 Debian installer: `code-oss-linux-x64.deb`
-            - Linux x64 RPM installer (Fedora/RPM-based distributions): `code-oss-linux-x64.rpm`
-            - Windows x64 portable archive: `code-oss-windows-x64.zip`
-            - Windows x64 user installer: `code-oss-windows-x64-setup.exe`
+          Included assets:
+          - Windows x64 setup installer and portable ZIP
+          - Debian/Ubuntu x64 .deb package
+          - Fedora/RHEL-compatible x64 .rpm package
+          - Generic Linux x64 .tar.gz archive
 
-            The bundled Copilot Chat/BYOK implementation is included, but `chat.disableAIFeatures` defaults to `true`, so built-in AI features start hidden/off for fresh profiles. Users can turn the setting off to enable those features. The BYOK known-model catalogue is bundled locally, so startup does not need to fetch `copilotChat.json` from Microsoft's CDN.
+          Extensions are served by Open VSX. Telemetry is disabled in the product configuration; update and AI-related settings have privacy-focused defaults.
+          EOF
+          )
 
-            `SHA256SUMS` contains SHA-256 checksums for all five downloads.
-          files: |
-            release-assets/code-oss-linux-x64.tar.gz
-            release-assets/code-oss-linux-x64.deb
-            release-assets/code-oss-linux-x64.rpm
-            release-assets/code-oss-windows-x64.zip
-            release-assets/code-oss-windows-x64-setup.exe
-            release-assets/SHA256SUMS
-          draft: false
-          prerelease: false
-          generate_release_notes: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
+          if gh release view "$UPSTREAM_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$UPSTREAM_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --notes "$notes"
+          else
+            gh release create "$UPSTREAM_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes"
+          fi
+
+          gh release upload "$UPSTREAM_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
   record:
-    needs: [check, build, release]
-    if: needs.check.outputs.changed == 'true' && needs.build.result == 'success' && needs.release.result == 'success'
+    needs: [check, release]
+    if: needs.check.outputs.changed == 'true'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
 
-      - name: Record successfully built release
+      - name: Record successfully published upstream release
         env:
           UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -733,6 +359,6 @@ jobs:
           git add .upstream-vscode-release
 
           if ! git diff --cached --quiet; then
-            git commit -m "chore: record upstream VS Code release"
+            git commit -m "chore: record upstream VS Code release $UPSTREAM_TAG"
             git push
           fi
