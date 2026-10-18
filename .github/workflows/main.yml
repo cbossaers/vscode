@@ -1,5 +1,5 @@
 
-name: Build Code - OSS
+name: Build Privacy-Hardened Code - OSS
 
 on:
   schedule:
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.release.outputs.changed }}
       tag: ${{ steps.release.outputs.tag }}
@@ -67,7 +67,7 @@ jobs:
   catalogue:
     needs: check
     if: needs.check.outputs.changed == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
 
     steps:
       - name: Fetch and validate the BYOK model catalogue
@@ -102,33 +102,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Build each platform once, then derive the no-AI package from the
+          # same compiled output. This avoids installing dependencies and
+          # compiling the same platform twice per release.
           - os: ubuntu-26.04
+            cache_os: linux
             platform: linux-x64
             task: vscode-linux-x64-min
             output: VSCode-linux-x64
-            archive: code-oss-linux-x64.tar.gz
-            flavor: standard
-
-          - os: ubuntu-26.04
-            platform: linux-x64
-            task: vscode-linux-x64-min
-            output: VSCode-linux-x64
-            archive: code-oss-linux-x64-no-ai.tar.gz
-            flavor: no-ai
+            archive_standard: code-oss-linux-x64.tar.gz
+            archive_no_ai: code-oss-linux-x64-no-ai.tar.gz
 
           - os: windows-2022
+            cache_os: windows
             platform: windows-x64
             task: vscode-win32-x64-min
             output: VSCode-win32-x64
-            archive: code-oss-windows-x64.zip
-            flavor: standard
-
-          - os: windows-2022
-            platform: windows-x64
-            task: vscode-win32-x64-min
-            output: VSCode-win32-x64
-            archive: code-oss-windows-x64-no-ai.zip
-            flavor: no-ai
+            archive_standard: code-oss-windows-x64.zip
+            archive_no_ai: code-oss-windows-x64-no-ai.zip
 
     steps:
       - name: Checkout upstream release
@@ -217,11 +208,86 @@ jobs:
 
           Set-Content $file -Value $source -Encoding utf8
 
+      # Reuse the dependency cache strategy and archive scripts from the
+      # checked-out upstream tag. Its key includes package manifests/lockfiles,
+      # npm configuration, cache salt, platform/architecture, and Node version.
+      - name: Prepare node_modules cache key (Linux)
+        if: runner.os == 'Linux'
+        id: node-modules-key-linux
+        working-directory: vscode
+        shell: bash
+        env:
+          CACHE_OS: ${{ matrix.cache_os }}
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+          node build/azure-pipelines/common/computeNodeModulesCacheKey.ts \
+            "$CACHE_OS" x64 "$(node -p process.arch)" > .build/packagelockhash
+          lock_hash="$(tr -d '\r\n' < .build/packagelockhash)"
+          echo "key=node_modules-${CACHE_OS}-${lock_hash}-node-$(node -p process.version)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare node_modules cache key (Windows)
+        if: runner.os == 'Windows'
+        id: node-modules-key-windows
+        working-directory: vscode
+        shell: pwsh
+        env:
+          CACHE_OS: ${{ matrix.cache_os }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force .build | Out-Null
+          $architecture = node -p process.arch
+          node build/azure-pipelines/common/computeNodeModulesCacheKey.ts $env:CACHE_OS x64 $architecture |
+            Set-Content -Path .build/packagelockhash -Encoding ascii
+          $lockHash = (Get-Content .build/packagelockhash -Raw).Trim()
+          $nodeVersion = node -p process.version
+          "key=node_modules-$env:CACHE_OS-$lockHash-node-$nodeVersion" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore node_modules cache
+        id: node-modules-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: vscode/.build/node_modules_cache
+          key: ${{ steps.node-modules-key-linux.outputs.key || steps.node-modules-key-windows.outputs.key }}
+
+      - name: Extract node_modules cache (Linux)
+        if: runner.os == 'Linux' && steps.node-modules-cache.outputs.cache-hit == 'true'
+        working-directory: vscode
+        shell: bash
+        run: ./.github/workflows/node_modules_cache/cache.sh extract
+
+      - name: Extract node_modules cache (Windows)
+        if: runner.os == 'Windows' && steps.node-modules-cache.outputs.cache-hit == 'true'
+        working-directory: vscode
+        shell: pwsh
+        run: ./.github/workflows/node_modules_cache/cache.ps1 extract
+
       - name: Install npm dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
         working-directory: vscode
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm install
+
+      - name: Archive node_modules cache (Linux)
+        if: runner.os == 'Linux' && steps.node-modules-cache.outputs.cache-hit != 'true'
+        working-directory: vscode
+        shell: bash
+        run: ./.github/workflows/node_modules_cache/cache.sh archive
+
+      - name: Archive node_modules cache (Windows)
+        if: runner.os == 'Windows' && steps.node-modules-cache.outputs.cache-hit != 'true'
+        working-directory: vscode
+        shell: pwsh
+        run: ./.github/workflows/node_modules_cache/cache.ps1 archive
+
+      - name: Save node_modules cache
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: vscode/.build/node_modules_cache
+          key: ${{ steps.node-modules-key-linux.outputs.key || steps.node-modules-key-windows.outputs.key }}
 
 
       - name: Download validated BYOK catalogue
@@ -322,8 +388,6 @@ jobs:
       - name: Configure Open VSX marketplace and telemetry ceiling
         working-directory: vscode
         shell: pwsh
-        env:
-          BUILD_FLAVOR: ${{ matrix.flavor }}
         run: |
           $ErrorActionPreference = "Stop"
           $file = "product.json"
@@ -334,38 +398,12 @@ jobs:
 
           $product = Get-Content $file -Raw | ConvertFrom-Json
 
-          # The standard edition retains Chat/BYOK but prevents the separate
-          # product-level mechanism from downloading an auto-updated copy.
-          # The no-ai edition removes optional Copilot/AI endpoint metadata.
-          # Keep defaultChatAgent: upstream types it as required and shared
-          # workbench code can dereference it even when Copilot Chat is absent.
-          if ($env:BUILD_FLAVOR -eq "no-ai") {
-            foreach ($propertyName in @(
-              "voiceWsUrl",
-              "agentSdks",
-              "copilotVersions",
-              "mcpGallery",
-              "aiConfig",
-              "chatParticipantRegistry",
-              "chatSessionRecommendations",
-              "agentsTelemetryAppName",
-              "trustedMcpAuthAccess",
-              "trustedExtensionAuthAccess",
-              "aiGeneratedWorkspaceTrust"
-            )) {
-              $product.PSObject.Properties.Remove($propertyName)
-            }
-            # This array is required by the upstream product configuration type.
-            $product | Add-Member `
-              -NotePropertyName builtInExtensionsEnabledWithAutoUpdates `
-              -NotePropertyValue @() `
-              -Force
-          } else {
-            $product | Add-Member `
-              -NotePropertyName builtInExtensionsEnabledWithAutoUpdates `
-              -NotePropertyValue @() `
-              -Force
-          }
+          # Build the standard edition once. The no-AI package is derived from
+          # the compiled output after the build, so both editions share binaries.
+          $product | Add-Member `
+            -NotePropertyName builtInExtensionsEnabledWithAutoUpdates `
+            -NotePropertyValue @() `
+            -Force
 
           if (-not $product.extensionsGallery) {
             $product | Add-Member `
@@ -539,7 +577,6 @@ jobs:
           Write-Host "Resolved package directory: $package"
 
       - name: Verify bundled Chat extension is retained
-        if: matrix.flavor == 'standard'
         shell: pwsh
         env:
           PACKAGE_DIR: ${{ steps.package.outputs.path }}
@@ -572,16 +609,29 @@ jobs:
 
           Write-Host "Standard edition retains bundled Chat/BYOK and loads the known-model catalogue locally."
 
-      - name: Remove Copilot AI from no-AI edition
-        if: matrix.flavor == 'no-ai'
+      - name: Create and verify no-AI package from the same build
+        id: no-ai-package
         shell: pwsh
         env:
           PACKAGE_DIR: ${{ steps.package.outputs.path }}
+          OUTPUT_DIR: ${{ matrix.output }}
         run: |
           $ErrorActionPreference = "Stop"
-          $extensions = Join-Path $env:PACKAGE_DIR "resources/app/extensions"
-          $copilot = Join-Path $extensions "copilot"
+          $sourcePackage = $env:PACKAGE_DIR
+          $noAiPackage = Join-Path $PWD ($env:OUTPUT_DIR + "-no-ai")
 
+          if (-not (Test-Path $sourcePackage -PathType Container)) {
+            throw "Standard package directory not found: $sourcePackage"
+          }
+          if (Test-Path $noAiPackage) {
+            Remove-Item $noAiPackage -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $noAiPackage -Force | Out-Null
+          Get-ChildItem -LiteralPath $sourcePackage -Force |
+            Copy-Item -Destination $noAiPackage -Recurse -Force
+
+          $extensions = Join-Path $noAiPackage "resources/app/extensions"
+          $copilot = Join-Path $extensions "copilot"
           if (Test-Path $copilot) {
             Remove-Item $copilot -Recurse -Force
           }
@@ -589,9 +639,17 @@ jobs:
             throw "Copilot extension still exists in the no-AI package."
           }
 
-          $productPath = Join-Path $env:PACKAGE_DIR "resources/app/product.json"
+          $productPath = Join-Path $noAiPackage "resources/app/product.json"
+          if (-not (Test-Path $productPath -PathType Leaf)) {
+            throw "No-AI package product.json not found: $productPath"
+          }
           $product = Get-Content $productPath -Raw | ConvertFrom-Json
-          foreach ($propertyName in @(
+
+          # These product-level endpoints/metadata are not needed when the
+          # bundled Copilot/AI extension has been removed. Remove them BEFORE
+          # validating the no-AI package (including copilotVersions, which
+          # otherwise makes a validation-only check fail).
+          $propertiesToRemove = @(
             "voiceWsUrl",
             "agentSdks",
             "copilotVersions",
@@ -603,19 +661,38 @@ jobs:
             "trustedMcpAuthAccess",
             "trustedExtensionAuthAccess",
             "aiGeneratedWorkspaceTrust"
-          )) {
-            if ($product.PSObject.Properties.Name -contains $propertyName) {
-              throw "No-AI product.json unexpectedly contains '$propertyName'."
+          )
+          foreach ($propertyName in $propertiesToRemove) {
+            if ($null -ne $product.PSObject.Properties[$propertyName]) {
+              [void]$product.PSObject.Properties.Remove($propertyName)
+              Write-Host "Removed no-AI product metadata: $propertyName"
             }
           }
-          if ($null -eq $product.builtInExtensionsEnabledWithAutoUpdates -or @($product.builtInExtensionsEnabledWithAutoUpdates).Count -ne 0) {
-            throw "No-AI edition must have an empty builtInExtensionsEnabledWithAutoUpdates array."
-          }
+
+          $product | Add-Member `
+            -NotePropertyName builtInExtensionsEnabledWithAutoUpdates `
+            -NotePropertyValue @() `
+            -Force
           if (-not $product.defaultChatAgent) {
             throw "Required defaultChatAgent compatibility metadata is missing from product.json."
           }
 
-          # Guard against the Copilot Chat manifest being renamed to another folder.
+          $productJson = $product | ConvertTo-Json -Depth 100
+          [System.IO.File]::WriteAllText(
+            $productPath,
+            $productJson + [Environment]::NewLine,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          # Read the file back from disk and validate the actual package, not
+          # only the in-memory object. This catches serialization/path issues.
+          $writtenProduct = Get-Content $productPath -Raw | ConvertFrom-Json
+          foreach ($propertyName in $propertiesToRemove) {
+            if ($null -ne $writtenProduct.PSObject.Properties[$propertyName]) {
+              throw "No-AI product.json unexpectedly contains '$propertyName' after removal."
+            }
+          }
+
           $manifests = Get-ChildItem $extensions -Filter package.json -Recurse -File -ErrorAction SilentlyContinue
           foreach ($manifestFile in $manifests) {
             try {
@@ -629,76 +706,80 @@ jobs:
             }
           }
 
-          Write-Host "No-AI edition has no bundled GitHub Copilot extension or optional Copilot/AI endpoint metadata."
-      - name: Archive Linux build
+          "path=$noAiPackage" >> $env:GITHUB_OUTPUT
+          Write-Host "Created no-AI package: $noAiPackage"
+
+      - name: Archive Linux builds
         if: runner.os == 'Linux'
         shell: bash
         env:
           PACKAGE_DIR: ${{ steps.package.outputs.path }}
-          ARCHIVE: ${{ matrix.archive }}
+          NO_AI_PACKAGE: ${{ steps.no-ai-package.outputs.path }}
+          ARCHIVE_STANDARD: ${{ matrix.archive_standard }}
+          ARCHIVE_NO_AI: ${{ matrix.archive_no_ai }}
         run: |
           set -euo pipefail
+          test -d "$PACKAGE_DIR"
+          test -d "$NO_AI_PACKAGE"
 
-          if [ ! -d "$PACKAGE_DIR" ]; then
-            echo "Build output directory not found: $PACKAGE_DIR"
-            exit 1
-          fi
+          tar -czf "$ARCHIVE_STANDARD" \
+            -C "$(dirname "$PACKAGE_DIR")" "$(basename "$PACKAGE_DIR")"
+          tar -czf "$ARCHIVE_NO_AI" \
+            -C "$(dirname "$NO_AI_PACKAGE")" "$(basename "$NO_AI_PACKAGE")"
 
-          tar -czf "$ARCHIVE" \
-            -C "$(dirname "$PACKAGE_DIR")" \
-            "$(basename "$PACKAGE_DIR")"
+          test -s "$ARCHIVE_STANDARD"
+          test -s "$ARCHIVE_NO_AI"
+          ls -lh "$ARCHIVE_STANDARD" "$ARCHIVE_NO_AI"
 
-          test -s "$ARCHIVE"
-          echo "Created archive: $ARCHIVE"
-          ls -lh "$ARCHIVE"
-
-      - name: Archive Windows build
+      - name: Archive Windows builds
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           PACKAGE_DIR: ${{ steps.package.outputs.path }}
-          ARCHIVE: ${{ matrix.archive }}
+          NO_AI_PACKAGE: ${{ steps.no-ai-package.outputs.path }}
+          ARCHIVE_STANDARD: ${{ matrix.archive_standard }}
+          ARCHIVE_NO_AI: ${{ matrix.archive_no_ai }}
         run: |
           $ErrorActionPreference = "Stop"
-
-          if (-not (Test-Path $env:PACKAGE_DIR -PathType Container)) {
-            throw "Build output directory not found: $env:PACKAGE_DIR"
+          foreach ($path in @($env:PACKAGE_DIR, $env:NO_AI_PACKAGE)) {
+            if (-not (Test-Path $path -PathType Container)) {
+              throw "Build output directory not found: $path"
+            }
           }
 
-          if (Test-Path $env:ARCHIVE) {
-            Remove-Item $env:ARCHIVE -Force
+          foreach ($archive in @($env:ARCHIVE_STANDARD, $env:ARCHIVE_NO_AI)) {
+            if (Test-Path $archive) {
+              Remove-Item $archive -Force
+            }
           }
 
-          Compress-Archive `
-            -Path $env:PACKAGE_DIR `
-            -DestinationPath $env:ARCHIVE `
-            -CompressionLevel Optimal
+          Compress-Archive -Path $env:PACKAGE_DIR -DestinationPath $env:ARCHIVE_STANDARD -CompressionLevel Optimal
+          Compress-Archive -Path $env:NO_AI_PACKAGE -DestinationPath $env:ARCHIVE_NO_AI -CompressionLevel Optimal
 
-          if (-not (Test-Path $env:ARCHIVE -PathType Leaf)) {
-            throw "Archive was not created: $env:ARCHIVE"
+          foreach ($archive in @($env:ARCHIVE_STANDARD, $env:ARCHIVE_NO_AI)) {
+            if (-not (Test-Path $archive -PathType Leaf)) {
+              throw "Archive was not created: $archive"
+            }
+            if ((Get-Item $archive).Length -eq 0) {
+              throw "Archive is empty: $archive"
+            }
+            Write-Host "Created archive: $archive ($((Get-Item $archive).Length) bytes)"
           }
 
-          $archiveInfo = Get-Item $env:ARCHIVE
-
-          if ($archiveInfo.Length -eq 0) {
-            throw "Archive is empty: $env:ARCHIVE"
-          }
-
-          Write-Host "Created archive: $($archiveInfo.FullName)"
-          Write-Host "Archive size: $($archiveInfo.Length) bytes"
-
-      - name: Upload artifact
+      - name: Upload platform archives
         uses: actions/upload-artifact@v7
         with:
-          name: code-oss-${{ matrix.flavor }}-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
-          path: ${{ matrix.archive }}
+          name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
+          path: |
+            ${{ matrix.archive_standard }}
+            ${{ matrix.archive_no_ai }}
           if-no-files-found: error
           retention-days: 30
 
   release:
     needs: [check, build]
     if: needs.check.outputs.changed == 'true' && needs.build.result == 'success'
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
 
     steps:
       - name: Download platform build artifacts
@@ -761,7 +842,7 @@ jobs:
   record:
     needs: [check, build, release]
     if: needs.check.outputs.changed == 'true' && needs.build.result == 'success' && needs.release.result == 'success'
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
