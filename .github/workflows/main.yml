@@ -37,7 +37,7 @@ jobs:
         id: release
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
@@ -51,7 +51,7 @@ jobs:
                | .[0].tag_name // empty')
 
           if [ -z "$TAG" ]; then
-            echo "No stable upstream release found"
+            echo "No stable release found"
             exit 1
           fi
 
@@ -76,7 +76,7 @@ jobs:
     if: needs.check.outputs.changed == 'true'
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    timeout-minutes: 180
 
     strategy:
       fail-fast: false
@@ -128,99 +128,146 @@ jobs:
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install npm dependencies
-        working-directory: vscode
-        run: npm install
-
-      
-      - name: Disable built-in Copilot for privacy build
+      - name: Install Windows SDK and locate SignTool
+        if: runner.os == 'Windows'
         shell: pwsh
-        working-directory: vscode
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Remove Copilot from built-in extension lists.
-          $productPath = "product.json"
-          $product = Get-Content $productPath -Raw |
-            ConvertFrom-Json
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
 
-          foreach ($key in @("builtInExtensions", "builtInExtensionsAfterBuild")) {
-            if ($product.$key) {
-              $product.$key = @(
-                $product.$key | Where-Object {
-                  $_.name -ne "copilot" -and
-                  $_.name -ne "GitHub.copilot"
-                }
-              )
+          # Reuse an SDK already installed on the runner.
+          $tool = $null
+
+          if (Test-Path $kits) {
+            $tool = Get-ChildItem `
+              -Path $kits `
+              -Filter signtool.exe `
+              -Recurse `
+              -File |
+              Where-Object {
+                $_.FullName -match '\\x64\\signtool\.exe$'
+              } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+          }
+
+          # Install the Windows SDK if SignTool is missing.
+          if (-not $tool) {
+            $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+            if (-not $winget) {
+              throw "SignTool is missing and winget is unavailable."
+            }
+
+            & winget.exe install `
+              --id Microsoft.WindowsSDK.10.0.22621 `
+              --exact `
+              --silent `
+              --accept-source-agreements `
+              --accept-package-agreements
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Windows SDK installation failed: $LASTEXITCODE"
+            }
+
+            if (Test-Path $kits) {
+              $tool = Get-ChildItem `
+                -Path $kits `
+                -Filter signtool.exe `
+                -Recurse `
+                -File |
+                Where-Object {
+                  $_.FullName -match '\\x64\\signtool\.exe$'
+                } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
             }
           }
 
-          $product | ConvertTo-Json -Depth 100 |
-            Set-Content -Path $productPath -Encoding utf8
-
-          # Locate the task that invokes the Copilot shim.
-          $gulpFile = "build/gulpfile.vscode.ts"
-          $source = Get-Content $gulpFile -Raw
-
-          if ($source -notmatch "prepareBuiltInCopilotRipgrepShim") {
-            throw "Expected Copilot shim call was not found; upstream changed."
+          if (-not $tool) {
+            throw "SignTool was not found after SDK installation."
           }
 
-          $source = $source -replace `
-            '(?m)^\s*prepareBuiltInCopilotRipgrepShim\([^;]*\);?\s*$',
-            '// Copilot omitted from privacy-focused build.'
+          $tool.DirectoryName |
+            Out-File -FilePath $env:GITHUB_PATH `
+              -Append -Encoding utf8
 
-          Set-Content -Path $gulpFile -Value $source -Encoding utf8
+          Write-Host "SignTool: $($tool.FullName)"
 
-          Write-Host "Patched product configuration and Copilot packaging."
+      - name: Install npm dependencies
+        working-directory: vscode
+        run: npm install
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
+      - name: Disable legacy product telemetry
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $path = "product.json"
+
+          if (-not (Test-Path $path)) {
+            throw "Source product.json not found: $path"
+          }
+
+          $product = Get-Content $path -Raw |
+            ConvertFrom-Json
+
+          $product | Add-Member `
+            -NotePropertyName enableTelemetry `
+            -NotePropertyValue $false `
+            -Force
+
+          $product |
+            ConvertTo-Json -Depth 100 |
+            Set-Content -Path $path -Encoding utf8
+
+          $check = Get-Content $path -Raw |
+            ConvertFrom-Json
+
+          if ($check.enableTelemetry -ne $false) {
+            throw "Could not disable legacy product telemetry."
+          }
+
+          Write-Host "Legacy telemetry flag disabled."
 
       - name: Build application
         working-directory: vscode
         env:
           NODE_ENV: production
-          # The upstream build fetch helper reads this variable.
-          # It authenticates GitHub API requests for release assets.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: npm run gulp ${{ matrix.task }}
 
-      - name: Harden product configuration
+      - name: Verify packaged product
         shell: pwsh
         env:
           OUTPUT_DIR: ${{ matrix.output }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $product = Join-Path `
-            "vscode/$env:OUTPUT_DIR" `
-            "resources/app/product.json"
+          $root = "vscode/$env:OUTPUT_DIR"
+
+          if (-not (Test-Path $root)) {
+            throw "Package output not found: $root"
+          }
+
+          $product = Join-Path $root "resources/app/product.json"
 
           if (-not (Test-Path $product)) {
-            throw "product.json not found: $product"
+            throw "Packaged product.json not found: $product"
           }
 
           $config = Get-Content $product -Raw |
             ConvertFrom-Json
 
-          $config | Add-Member `
-            -NotePropertyName enableTelemetry `
-            -NotePropertyValue $false `
-            -Force
-
-          $json = $config | ConvertTo-Json -Depth 100
-
-          [System.IO.File]::WriteAllText(
-            (Resolve-Path $product).Path,
-            $json,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          $verify = Get-Content $product -Raw |
-            ConvertFrom-Json
-
-          if ($verify.enableTelemetry -ne $false) {
-            throw "Telemetry flag verification failed"
+          if ($config.enableTelemetry -ne $false) {
+            throw "Packaged product telemetry flag is not disabled."
           }
+
+          Write-Host "Packaged product telemetry flag verified."
 
       - name: Create portable privacy settings
         shell: pwsh
@@ -229,11 +276,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Portable mode reads data/user-data/User/settings.json
-          # relative to the packaged application directory.
-          $settingsDir = Join-Path `
-            "vscode/$env:OUTPUT_DIR" `
-            "data/user-data/User"
+          $root = "vscode/$env:OUTPUT_DIR"
+
+          if (-not (Test-Path $root)) {
+            throw "Package output not found: $root"
+          }
+
+          $settingsDir = Join-Path $root "data/user-data/User"
 
           New-Item -ItemType Directory -Force `
             -Path $settingsDir | Out-Null
@@ -247,14 +296,14 @@ jobs:
             "extensions.autoUpdate" = $false
           }
 
-          $settingsPath = Join-Path `
-            $settingsDir "settings.json"
+          $settingsPath = Join-Path $settingsDir "settings.json"
 
-          $settings | ConvertTo-Json |
+          $settings |
+            ConvertTo-Json |
             Set-Content -Path $settingsPath -Encoding utf8
 
           if (-not (Test-Path $settingsPath)) {
-            throw "Privacy settings were not created"
+            throw "Privacy settings were not created."
           }
 
           Write-Host "Portable privacy settings created."
@@ -285,7 +334,6 @@ jobs:
     name: Record successful release
     needs: [check, build]
     if: needs.check.outputs.changed == 'true'
-
     runs-on: ubuntu-latest
 
     steps:
