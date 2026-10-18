@@ -102,9 +102,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Build each platform once, then derive the no-AI package from the
-          # same compiled output. This avoids installing dependencies and
-          # compiling the same platform twice per release.
+          # Each platform installs dependencies once, builds the standard
+          # edition, then rebuilds the same checkout after removing core
+          # Chat/agent entry points for the no-AI edition. node_modules is reused.
           - os: ubuntu-26.04
             cache_os: linux
             platform: linux-x64
@@ -291,7 +291,7 @@ jobs:
 
 
       - name: Download validated BYOK catalogue
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: byok-known-model-catalogue-${{ needs.check.outputs.tag }}
           path: byok-catalogue
@@ -398,8 +398,8 @@ jobs:
 
           $product = Get-Content $file -Raw | ConvertFrom-Json
 
-          # Build the standard edition once. The no-AI package is derived from
-          # the compiled output after the build, so both editions share binaries.
+          # Configure the standard edition here. After its archive is created,
+          # a separate source-patched build produces the no-AI edition.
           $product | Add-Member `
             -NotePropertyName builtInExtensionsEnabledWithAutoUpdates `
             -NotePropertyValue @() `
@@ -609,162 +609,631 @@ jobs:
 
           Write-Host "Standard edition retains bundled Chat/BYOK and loads the known-model catalogue locally."
 
-      - name: Create and verify no-AI package from the same build
-        id: no-ai-package
+      - name: Archive standard Linux build
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.path }}
+          ARCHIVE: ${{ matrix.archive_standard }}
+        run: |
+          set -euo pipefail
+          test -d "$PACKAGE_DIR"
+          tar -czf "$ARCHIVE" -C "$(dirname "$PACKAGE_DIR")" "$(basename "$PACKAGE_DIR")"
+          test -s "$ARCHIVE"
+          ls -lh "$ARCHIVE"
+
+      - name: Archive standard Windows build
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           PACKAGE_DIR: ${{ steps.package.outputs.path }}
-          OUTPUT_DIR: ${{ matrix.output }}
+          ARCHIVE: ${{ matrix.archive_standard }}
         run: |
           $ErrorActionPreference = "Stop"
-          $sourcePackage = $env:PACKAGE_DIR
-          $noAiPackage = Join-Path $PWD ($env:OUTPUT_DIR + "-no-ai")
+          if (-not (Test-Path $env:PACKAGE_DIR -PathType Container)) {
+            throw "Standard package directory not found: $env:PACKAGE_DIR"
+          }
+          if (Test-Path $env:ARCHIVE) { Remove-Item $env:ARCHIVE -Force }
+          Compress-Archive -Path $env:PACKAGE_DIR -DestinationPath $env:ARCHIVE -CompressionLevel Optimal
+          if (-not (Test-Path $env:ARCHIVE -PathType Leaf) -or (Get-Item $env:ARCHIVE).Length -eq 0) {
+            throw "Standard archive was not created or is empty: $env:ARCHIVE"
+          }
+          Write-Host "Created standard archive: $env:ARCHIVE"
 
-          if (-not (Test-Path $sourcePackage -PathType Container)) {
-            throw "Standard package directory not found: $sourcePackage"
-          }
-          if (Test-Path $noAiPackage) {
-            Remove-Item $noAiPackage -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $noAiPackage -Force | Out-Null
-          Get-ChildItem -LiteralPath $sourcePackage -Force |
-            Copy-Item -Destination $noAiPackage -Recurse -Force
+      - name: Remove core AI, Chat, and agent functionality from no-AI source
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          $extensions = Join-Path $noAiPackage "resources/app/extensions"
-          $copilot = Join-Path $extensions "copilot"
-          if (Test-Path $copilot) {
-            Remove-Item $copilot -Recurse -Force
-          }
-          if (Test-Path $copilot) {
-            throw "Copilot extension still exists in the no-AI package."
+          # The standard build has already been archived. Recompile the same
+          # source after removing every built-in AI/Chat entry-point import.
+          # VS Code loads core contributions from these explicit main files;
+          # this prevents the contributions from being included in the no-AI
+          # edition's runtime bundles rather than merely hiding their UI.
+          $targets = @{
+            "src/vs/workbench/workbench.common.main.ts" = @(
+              "/contrib/chat/",
+              "/contrib/inlineChat/",
+              "/contrib/agentsVoice/",
+              "/contrib/welcomeAgentSessions/",
+              "/contrib/remoteCodingAgents/",
+              "/contrib/mcp/",
+              "/contrib/speech/",
+              "/contrib/imageCarousel/",
+              "/services/mcp/",
+              "/platform/mcp/",
+              "/services/chat/",
+              "/services/agentHost/",
+              "/platform/agentHost/",
+              "/platform/copilotConnectors/",
+              "/services/aiEmbeddingVector/",
+              "/services/aiRelatedInformation/",
+              "/services/aiSettingsSearch/",
+              "/authenticationMcp",
+              "/common/agentsColors.js",
+              "/common/agentsSizes.js"
+            )
+            "src/vs/workbench/workbench.desktop.main.ts" = @(
+              "/contrib/chat/",
+              "/contrib/inlineChat/",
+              "/contrib/agentsVoice/",
+              "/contrib/welcomeAgentSessions/",
+              "/contrib/remoteCodingAgents/",
+              "/contrib/mcp/",
+              "/contrib/speech/",
+              "/services/mcp/",
+              "/platform/mcp/",
+              "/services/localTranscription/",
+              "/services/chat/",
+              "/services/agentHost/",
+              "/platform/agentHost/",
+              "/platform/copilotConnectors/"
+            )
+            "src/vs/workbench/workbench.web.main.ts" = @(
+              "/contrib/chat/",
+              "/contrib/inlineChat/",
+              "/contrib/agentsVoice/",
+              "/contrib/welcomeAgentSessions/",
+              "/contrib/remoteCodingAgents/",
+              "/contrib/mcp/",
+              "/contrib/speech/",
+              "/contrib/imageCarousel/",
+              "/services/mcp/",
+              "/platform/mcp/",
+              "/services/chat/",
+              "/services/agentHost/",
+              "/platform/agentHost/",
+              "/platform/copilotConnectors/",
+              "/services/aiEmbeddingVector/",
+              "/services/aiRelatedInformation/",
+              "/services/aiSettingsSearch/",
+              "/authenticationMcp",
+              "/common/agentsColors.js",
+              "/common/agentsSizes.js"
+            )
+            "src/vs/sessions/sessions.common.main.ts" = @(
+              "/contrib/chat/",
+              "/contrib/inlineChat/",
+              "/contrib/agentsVoice/",
+              "/contrib/welcomeAgentSessions/",
+              "/contrib/remoteCodingAgents/",
+              "/contrib/mcp/",
+              "/contrib/speech/",
+              "/contrib/imageCarousel/",
+              "/contrib/aiCustomizationTreeView/",
+              "/contrib/copilotChatSessions/",
+              "/contrib/agentHostFilter/",
+              "/contrib/providers/agentHost/",
+              "/contrib/providers/remoteAgentHost/",
+              "/contrib/sessionComparison/",
+              "/contrib/chatDebug/",
+              "/contrib/codeReview/",
+              "/contrib/remoteSessions/",
+              "/contrib/applyCommitsToParentRepo/",
+              "/contrib/changes/",
+              "/contrib/automations/",
+              "/contrib/tunnelHost/",
+              "/contrib/agentFeedback/",
+              "/contrib/sessions/",
+              "/contrib/github/",
+              "/contrib/agentHost/",
+              "/services/mcp/",
+              "/platform/mcp/",
+              "/services/chat/",
+              "/services/agentHost/",
+              "/platform/agentHost/",
+              "/platform/copilotConnectors/",
+              "/services/aiEmbeddingVector/",
+              "/services/aiRelatedInformation/",
+              "/services/aiSettingsSearch/",
+              "/services/agentHostFilter/",
+              "/services/localTranscription/",
+              "/authenticationMcp"
+            )
+            "src/vs/sessions/sessions.desktop.main.ts" = @(
+              "/contrib/openAgentsWindow/",
+              "/contrib/chat/",
+              "/contrib/inlineChat/",
+              "/contrib/agentsVoice/",
+              "/contrib/mcp/",
+              "/contrib/agentFeedback/",
+              "/contrib/providers/agentHost/",
+              "/contrib/providers/remoteAgentHost/",
+              "/contrib/remoteCodingAgents/",
+              "/contrib/welcomeAgentSessions/",
+              "/platform/copilotConnectors/",
+              "/platform/mcp/",
+              "/platform/agentHost/",
+              "/workbench/contrib/chat/",
+              "/workbench/contrib/mcp/",
+              "/workbench/contrib/agentsVoice/",
+              "/workbench/services/mcp/",
+              "/workbench/services/agentHost/",
+              "/workbench/services/localTranscription/"
+            )
+            "src/vs/sessions/sessions.web.main.ts" = @(
+              "/contrib/chat/",
+              "/contrib/inlineChat/",
+              "/contrib/agentsVoice/",
+              "/contrib/mcp/",
+              "/contrib/agentFeedback/",
+              "/contrib/providers/agentHost/",
+              "/contrib/providers/remoteAgentHost/",
+              "/contrib/remoteCodingAgents/",
+              "/contrib/welcomeAgentSessions/",
+              "/platform/mcp/",
+              "/platform/agentHost/",
+              "/workbench/contrib/chat/",
+              "/workbench/contrib/mcp/",
+              "/workbench/contrib/agentsVoice/",
+              "/workbench/services/mcp/",
+              "/workbench/services/agentHost/",
+              "/workbench/services/localTranscription/"
+            )
+            # This small core editor contribution directly wires up an AI-based
+            # empty-editor chat hint and speech dictation. Drop only those roots
+            # in this edition; editor fundamentals remain enabled.
+            "src/vs/workbench/contrib/codeEditor/browser/codeEditor.contribution.ts" = @(
+              "/emptyTextEditorHint/emptyTextEditorHint.js",
+              "/dictation/editorDictation.js"
+            )
           }
 
-          $productPath = Join-Path $noAiPackage "resources/app/product.json"
-          if (-not (Test-Path $productPath -PathType Leaf)) {
-            throw "No-AI package product.json not found: $productPath"
-          }
-          $product = Get-Content $productPath -Raw | ConvertFrom-Json
+          # Remove a complete static import statement, including multiline named
+          # imports. Matching only the first line can leave broken TypeScript or
+          # silently retain an AI dependency when upstream reformats an import.
+          $registrationPattern = '(?im)^[ \t]*registerSingleton\([^;\r\n]*(?:Mcp|AgentHost|Copilot|Chat|AgentsVoice|AiEmbedding|AiRelated|AiSettings|RemoteCodingAgent|AgentFeedback|PluginGit|Transcription|SessionComparison|SessionGroup|SessionSection|SessionList|SessionManagement|CloudSandbox)[^;\r\n]*;[ \t]*(?:\r?\n)?'
+          $removedTotal = 0
 
-          # These product-level endpoints/metadata are not needed when the
-          # bundled Copilot/AI extension has been removed. Remove them BEFORE
-          # validating the no-AI package (including copilotVersions, which
-          # otherwise makes a validation-only check fail).
+          foreach ($relativePath in $targets.Keys) {
+            if (-not (Test-Path $relativePath -PathType Leaf)) {
+              throw "Expected entry point not found: $relativePath. Upstream layout changed; refusing to produce a misleading no-AI build."
+            }
+
+            $fullPath = (Resolve-Path $relativePath).Path
+            $source = [System.IO.File]::ReadAllText($fullPath) -replace "`r`n", "`n"
+            $removedImports = 0
+
+            foreach ($fragment in $targets[$relativePath]) {
+              $escapedFragment = [regex]::Escape($fragment)
+              $importPattern = '(?m)^[ \t]*import\b[^;]*' + $escapedFragment + '[^;]*;[ \t]*(?:\r?\n)?'
+              $matches = [regex]::Matches($source, $importPattern)
+              if ($matches.Count -gt 0) {
+                $removedImports += $matches.Count
+                $source = [regex]::Replace($source, $importPattern, '')
+              }
+            }
+
+            $beforeRegistrations = [regex]::Matches($source, $registrationPattern).Count
+            $source = [regex]::Replace($source, $registrationPattern, '')
+            $removedRegistrations = $beforeRegistrations
+
+            # The open-agents command is a direct call rather than a contribution
+            # registration. Its import was removed above; remove the invocation too.
+            $openAgentsPattern = '(?m)^[ \t]*registerOpenAgentsWindowCommand\(\);[ \t]*(?:\r?\n)?'
+            $removedOpenAgentsCall = [regex]::Matches($source, $openAgentsPattern).Count
+            $source = [regex]::Replace($source, $openAgentsPattern, '')
+
+            $minimum = switch ($relativePath) {
+              "src/vs/workbench/workbench.common.main.ts" { 15 }
+              "src/vs/workbench/workbench.desktop.main.ts" { 8 }
+              "src/vs/workbench/workbench.web.main.ts" { 6 }
+              "src/vs/sessions/sessions.common.main.ts" { 30 }
+              "src/vs/sessions/sessions.desktop.main.ts" { 18 }
+              "src/vs/sessions/sessions.web.main.ts" { 15 }
+              "src/vs/workbench/contrib/codeEditor/browser/codeEditor.contribution.ts" { 2 }
+              default { throw "No patch minimum configured for $relativePath" }
+            }
+            $removedFromFile = $removedImports + $removedRegistrations + $removedOpenAgentsCall
+            if ($removedFromFile -lt $minimum) {
+              throw "Only removed $removedFromFile AI-related imports/registrations from $relativePath; expected at least $minimum. Upstream may have changed; refusing to label this build AI-free."
+            }
+
+            # Guard against an upstream edit that moved an AI import to a different
+            # line format. The regex catches multiline imports, not just one-line ones.
+            foreach ($fragment in $targets[$relativePath]) {
+              $escapedFragment = [regex]::Escape($fragment)
+              $remainingImportPattern = '(?m)^[ \t]*import\b[^;]*' + $escapedFragment + '[^;]*;'
+              if ([regex]::IsMatch($source, $remainingImportPattern)) {
+                throw "AI-related import remains in $relativePath matching '$fragment'."
+              }
+            }
+
+            [System.IO.File]::WriteAllText($fullPath, $source, [System.Text.UTF8Encoding]::new($false))
+            $removedTotal += $removedFromFile
+            Write-Host "$relativePath`: removed $removedImports AI imports, $removedRegistrations AI service registrations, and $removedOpenAgentsCall agent-window calls."
+          }
+
+          if ($removedTotal -lt 100) {
+            throw "Only $removedTotal AI-related entry-point imports/registrations were removed; expected at least 100. Upstream may have changed; refusing to label this build AI-free."
+          }
+
+          Write-Host "Removed built-in Chat, inline Chat, model catalogue, MCP, voice, Copilot connector, remote/local agent host and dedicated Agent Sessions entry-point roots before recompilation."
+
+      - name: Strip Copilot-specific product configuration for no-AI build
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $file = "product.json"
+          $product = Get-Content $file -Raw | ConvertFrom-Json
+
           $propertiesToRemove = @(
-            "voiceWsUrl",
-            "agentSdks",
+            "defaultChatAgent",
             "copilotVersions",
+            "agentSdks",
             "mcpGallery",
             "aiConfig",
             "chatParticipantRegistry",
             "chatSessionRecommendations",
             "agentsTelemetryAppName",
             "trustedMcpAuthAccess",
-            "trustedExtensionAuthAccess",
-            "aiGeneratedWorkspaceTrust"
+            "aiGeneratedWorkspaceTrust",
+            "voiceWsUrl",
+            "settingsSearchUrl",
+            "settingsSearchBuildId",
+            "dictationRuntime",
+            "sessionsWindowAllowedExtensions"
           )
           foreach ($propertyName in $propertiesToRemove) {
             if ($null -ne $product.PSObject.Properties[$propertyName]) {
               [void]$product.PSObject.Properties.Remove($propertyName)
-              Write-Host "Removed no-AI product metadata: $propertyName"
+              Write-Host "Removed product metadata: $propertyName"
             }
           }
 
-          $product | Add-Member `
-            -NotePropertyName builtInExtensionsEnabledWithAutoUpdates `
-            -NotePropertyValue @() `
-            -Force
-          if (-not $product.defaultChatAgent) {
-            throw "Required defaultChatAgent compatibility metadata is missing from product.json."
-          }
-
-          $productJson = $product | ConvertTo-Json -Depth 100
-          [System.IO.File]::WriteAllText(
-            $productPath,
-            $productJson + [Environment]::NewLine,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          # Read the file back from disk and validate the actual package, not
-          # only the in-memory object. This catches serialization/path issues.
-          $writtenProduct = Get-Content $productPath -Raw | ConvertFrom-Json
-          foreach ($propertyName in $propertiesToRemove) {
-            if ($null -ne $writtenProduct.PSObject.Properties[$propertyName]) {
-              throw "No-AI product.json unexpectedly contains '$propertyName' after removal."
-            }
-          }
-
-          $manifests = Get-ChildItem $extensions -Filter package.json -Recurse -File -ErrorAction SilentlyContinue
-          foreach ($manifestFile in $manifests) {
-            try {
-              $manifest = Get-Content $manifestFile.FullName -Raw | ConvertFrom-Json
-              if ($manifest.publisher -eq "GitHub" -and $manifest.name -in @("copilot-chat", "copilot")) {
-                throw "Copilot extension manifest still exists: $($manifestFile.FullName)"
+          # Remove Copilot references from extension-related product dictionaries.
+          foreach ($dictionaryName in @(
+            "trustedExtensionAuthAccess",
+            "extensionConfigurationPolicy",
+            "extensionEnabledApiProposals",
+            "extensionKind",
+            "extensionSyncedKeys",
+            "extensionUntrustedWorkspaceSupport",
+            "extensionVirtualWorkspacesSupport",
+            "extensionProperties"
+          )) {
+            $dictionary = $product.PSObject.Properties[$dictionaryName]
+            if ($null -eq $dictionary -or $null -eq $dictionary.Value) { continue }
+            foreach ($key in @($dictionary.Value.PSObject.Properties.Name)) {
+              if ($key -match '(?i)copilot') {
+                [void]$dictionary.Value.PSObject.Properties.Remove($key)
+              } else {
+                $entry = $dictionary.Value.PSObject.Properties[$key]
+                if ($null -ne $entry.Value -and $entry.Value -is [array]) {
+                  $filtered = @($entry.Value | Where-Object { "$($_)" -notmatch '(?i)copilot' })
+                  if ($filtered.Count -eq 0) {
+                    [void]$dictionary.Value.PSObject.Properties.Remove($key)
+                  } else {
+                    $dictionary.Value | Add-Member -NotePropertyName $key -NotePropertyValue $filtered -Force
+                  }
+                }
               }
-            } catch {
-              if ($_.Exception.Message -like "Copilot extension manifest still exists:*") { throw }
-              throw "Could not validate extension manifest '$($manifestFile.FullName)': $($_.Exception.Message)"
             }
           }
 
-          "path=$noAiPackage" >> $env:GITHUB_OUTPUT
-          Write-Host "Created no-AI package: $noAiPackage"
+          if ($null -ne $product.remoteDefaultExtensionsIfInstalledLocally) {
+            $product.remoteDefaultExtensionsIfInstalledLocally = @(
+              $product.remoteDefaultExtensionsIfInstalledLocally | Where-Object { "$_" -notmatch '(?i)copilot' }
+            )
+          }
+          if ($null -ne $product.builtInExtensions) {
+            $product.builtInExtensions = @(
+              $product.builtInExtensions | Where-Object { "$($_.name)" -notmatch '(?i)copilot' }
+            )
+          }
+          $product | Add-Member -NotePropertyName builtInExtensionsEnabledWithAutoUpdates -NotePropertyValue @() -Force
 
-      - name: Archive Linux builds
+          # Give this edition a separate identity and data directory so it
+          # cannot silently re-load Copilot extensions installed by the
+          # standard edition in the same user profile.
+          $identity = @{
+            nameShort = "Code - OSS (No AI)"
+            nameLong = "Code - OSS (No AI)"
+            applicationName = "code-oss-no-ai"
+            dataFolderName = ".vscode-oss-no-ai"
+            sharedDataFolderName = ".vscode-oss-no-ai-shared"
+            urlProtocol = "code-oss-no-ai"
+            win32MutexName = "codeossnoai"
+            win32SetupMutexName = "codeossnoaisetup"
+            win32RegValueName = "CodeOSSNoAI"
+            win32NameVersion = "Code - OSS No AI"
+            win32DirName = "Code - OSS No AI"
+            win32AppUserModelId = "CodeOSSNoAI"
+            linuxDesktopName = "code-oss-no-ai"
+            serverApplicationName = "code-server-oss-no-ai"
+            serverDataFolderName = ".vscode-server-oss-no-ai"
+            tunnelApplicationName = "code-tunnel-oss-no-ai"
+          }
+          foreach ($entry in $identity.GetEnumerator()) {
+            $product | Add-Member -NotePropertyName $entry.Key -NotePropertyValue $entry.Value -Force
+          }
+
+          $serialized = $product | ConvertTo-Json -Depth 100
+          [System.IO.File]::WriteAllText($file, $serialized + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+
+          $written = Get-Content $file -Raw | ConvertFrom-Json
+          foreach ($propertyName in $propertiesToRemove) {
+            if ($null -ne $written.PSObject.Properties[$propertyName]) {
+              throw "No-AI source product.json still contains '$propertyName'."
+            }
+          }
+          if ($written.dataFolderName -ne ".vscode-oss-no-ai" -or $written.applicationName -ne "code-oss-no-ai") {
+            throw "No-AI profile isolation settings were not written correctly."
+          }
+          Write-Host "No-AI product metadata stripped and profile isolated."
+
+      - name: Remove Copilot SDK fallback from no-AI runtime
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sourcePath = "src/vs/platform/product/common/product.ts"
+          if (-not (Test-Path $sourcePath -PathType Leaf)) {
+            throw "Product runtime source not found: $sourcePath"
+          }
+          $source = [System.IO.File]::ReadAllText($sourcePath) -replace "`r`n", "`n"
+
+          # Remove the helper that derives Copilot versions from package.json.
+          $helperMarker = "function getDependencyVersion("
+          if ([regex]::Matches($source, [regex]::Escape($helperMarker)).Count -ne 1) {
+            throw "Could not find exactly one getDependencyVersion helper in $sourcePath."
+          }
+          $helperStart = $source.IndexOf($helperMarker)
+          $helperEnd = $source.IndexOf("`n}", $helperStart)
+          if ($helperEnd -lt 0) { throw "Could not locate end of getDependencyVersion helper." }
+          $source = $source.Remove($helperStart, ($helperEnd + 2) - $helperStart)
+
+          # Remove the startup fallback that repopulates product.copilotVersions
+          # from the packaged @github/copilot-sdk dependency.
+          $blockMarker = "if (!product.copilotVersions) {"
+          if ([regex]::Matches($source, [regex]::Escape($blockMarker)).Count -ne 1) {
+            throw "Could not find exactly one Copilot version fallback in $sourcePath."
+          }
+          $blockStart = $source.IndexOf($blockMarker)
+          $braceStart = $source.IndexOf("{", $blockStart)
+          $depth = 0
+          $blockEnd = -1
+          for ($i = $braceStart; $i -lt $source.Length; $i++) {
+            if ($source[$i] -eq '{') { $depth++ }
+            elseif ($source[$i] -eq '}') {
+              $depth--
+              if ($depth -eq 0) { $blockEnd = $i; break }
+            }
+          }
+          if ($blockEnd -lt 0) { throw "Could not find end of Copilot version fallback block." }
+          $source = $source.Remove($blockStart, ($blockEnd + 1) - $blockStart)
+          $source = [regex]::Replace($source, '(?m)^\s*readonly copilotRuntimeVersion\?: string;\n', '')
+
+          if ($source.Contains($blockMarker) -or $source.Contains("copilotVersions:")) {
+            throw "Copilot version fallback still exists in $sourcePath after patching."
+          }
+          [System.IO.File]::WriteAllText($sourcePath, $source, [System.Text.UTF8Encoding]::new($false))
+
+          # Keep runtime package metadata from advertising or installing the SDK.
+          $packagePath = "package.json"
+          $package = Get-Content $packagePath -Raw | ConvertFrom-Json
+          if ($null -ne $package.PSObject.Properties["copilotRuntimeVersion"]) {
+            [void]$package.PSObject.Properties.Remove("copilotRuntimeVersion")
+          }
+          foreach ($dependencyField in @("dependencies", "optionalDependencies")) {
+            $dependencies = $package.PSObject.Properties[$dependencyField]
+            if ($null -ne $dependencies -and $null -ne $dependencies.Value -and
+                $null -ne $dependencies.Value.PSObject.Properties["@github/copilot-sdk"]) {
+              [void]$dependencies.Value.PSObject.Properties.Remove("@github/copilot-sdk")
+            }
+          }
+          $packageJson = $package | ConvertTo-Json -Depth 100
+          [System.IO.File]::WriteAllText($packagePath, $packageJson + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+
+          $verified = [System.IO.File]::ReadAllText($sourcePath)
+          if ($verified.Contains($blockMarker) -or $verified.Contains("copilotVersions:")) {
+            throw "Product runtime source still contains Copilot runtime-version logic."
+          }
+          Write-Host "Removed the runtime Copilot version fallback and SDK package metadata for the no-AI build."
+
+      - name: Rebuild application without Chat and agent functionality
+        working-directory: vscode
+        env:
+          NODE_ENV: production
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run gulp ${{ matrix.task }}
+
+      - name: Resolve no-AI build output directory
+        id: no-ai-package
+        shell: pwsh
+        env:
+          OUTPUT_DIR: ${{ matrix.output }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candidates = @(
+            (Join-Path $PWD $env:OUTPUT_DIR),
+            (Join-Path (Join-Path $PWD "vscode") $env:OUTPUT_DIR)
+          )
+          $package = $null
+          foreach ($candidate in $candidates) {
+            if (Test-Path $candidate -PathType Container) {
+              $package = (Resolve-Path $candidate).Path
+              break
+            }
+          }
+          if (-not $package) {
+            throw "No-AI build output '$env:OUTPUT_DIR' was not found after recompilation."
+          }
+          "path=$package" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved no-AI package directory: $package"
+
+      - name: Remove bundled AI extensions and verify no-AI package
+        shell: pwsh
+        env:
+          PACKAGE_DIR: ${{ steps.no-ai-package.outputs.path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # The Agents/Sessions app is emitted as a separate bundle, outside
+          # the main workbench entrypoints. Remove that compiled runtime from
+          # the no-AI edition only. The standard archive was already created
+          # and must retain the upstream Sessions feature.
+          $sessionsBundle = Join-Path $env:PACKAGE_DIR "resources/app/out/vs/sessions"
+          if (Test-Path $sessionsBundle -PathType Container) {
+            Remove-Item $sessionsBundle -Recurse -Force
+            Write-Host "Removed compiled Agents/Sessions runtime from no-AI package."
+          }
+          if (Test-Path $sessionsBundle) {
+            throw "Agents/Sessions runtime remains in no-AI package: $sessionsBundle"
+          }
+          $remainingSessions = Get-ChildItem $env:PACKAGE_DIR -Filter "sessions.desktop.main.js" -Recurse -File -ErrorAction SilentlyContinue
+          if ($remainingSessions) {
+            throw "Agents/Sessions entrypoint remains in no-AI package: $($remainingSessions[0].FullName)"
+          }
+
+          # Some upstream tags may package this SDK separately from the
+          # extension. Remove it from the no-AI distribution if present.
+          $sdkCandidates = @(
+            (Join-Path $env:PACKAGE_DIR "resources/app/node_modules/@github/copilot-sdk"),
+            (Join-Path $env:PACKAGE_DIR "node_modules/@github/copilot-sdk")
+          )
+          foreach ($sdkPath in $sdkCandidates) {
+            if (Test-Path $sdkPath -PathType Container) {
+              Remove-Item $sdkPath -Recurse -Force
+              Write-Host "Removed packaged Copilot SDK: $sdkPath"
+            }
+          }
+
+          $extensions = Join-Path $env:PACKAGE_DIR "resources/app/extensions"
+          if (-not (Test-Path $extensions -PathType Container)) {
+            throw "Packaged extensions directory is missing: $extensions"
+          }
+
+          foreach ($extensionDir in Get-ChildItem $extensions -Directory -Force) {
+            $remove = $false
+            foreach ($manifestFile in Get-ChildItem $extensionDir.FullName -Filter package.json -Recurse -File -ErrorAction SilentlyContinue) {
+              try {
+                $manifest = Get-Content $manifestFile.FullName -Raw | ConvertFrom-Json
+                $publisher = "$($manifest.publisher)"
+                $name = "$($manifest.name)"
+                if (($publisher -match '(?i)github' -and $name -match '(?i)copilot') -or
+                    "$publisher.$name" -match '(?i)github\.copilot') {
+                  $remove = $true
+                  Write-Host "Removing bundled AI extension: $publisher.$name ($($extensionDir.Name))"
+                  break
+                }
+              } catch {
+                throw "Could not inspect extension manifest '$($manifestFile.FullName)': $($_.Exception.Message)"
+              }
+            }
+            if ($remove) { Remove-Item $extensionDir.FullName -Recurse -Force }
+          }
+
+          $sdkPath = Join-Path $env:PACKAGE_DIR "resources/app/node_modules/@github/copilot-sdk"
+          if (Test-Path $sdkPath -PathType Container) { Remove-Item $sdkPath -Recurse -Force }
+          if (Test-Path $sdkPath) { throw "Copilot SDK package remains in no-AI app: $sdkPath" }
+
+          $productPath = Join-Path $env:PACKAGE_DIR "resources/app/product.json"
+          $product = Get-Content $productPath -Raw | ConvertFrom-Json
+          $forbiddenProperties = @(
+            "defaultChatAgent", "copilotVersions", "agentSdks", "mcpGallery",
+            "aiConfig", "chatParticipantRegistry", "chatSessionRecommendations",
+            "agentsTelemetryAppName", "trustedMcpAuthAccess", "aiGeneratedWorkspaceTrust", "voiceWsUrl",
+            "settingsSearchUrl", "settingsSearchBuildId", "dictationRuntime", "sessionsWindowAllowedExtensions"
+          )
+          foreach ($propertyName in $forbiddenProperties) {
+            if ($null -ne $product.PSObject.Properties[$propertyName]) {
+              throw "No-AI packaged product.json still contains '$propertyName'."
+            }
+          }
+          if ($product.applicationName -ne "code-oss-no-ai" -or $product.dataFolderName -ne ".vscode-oss-no-ai") {
+            throw "No-AI package does not have an isolated application/profile identity."
+          }
+          $appPackagePath = Join-Path $env:PACKAGE_DIR "resources/app/package.json"
+          if (Test-Path $appPackagePath -PathType Leaf) {
+            $appPackage = Get-Content $appPackagePath -Raw | ConvertFrom-Json
+            if ($null -ne $appPackage.PSObject.Properties["copilotRuntimeVersion"]) {
+              throw "Packaged app package.json still advertises copilotRuntimeVersion."
+            }
+            if ($null -ne $appPackage.dependencies -and $null -ne $appPackage.dependencies.PSObject.Properties["@github/copilot-sdk"]) {
+              throw "Packaged app still declares @github/copilot-sdk."
+            }
+          }
+
+          $remainingManifests = Get-ChildItem $extensions -Filter package.json -Recurse -File -ErrorAction SilentlyContinue
+          foreach ($manifestFile in $remainingManifests) {
+            $manifest = Get-Content $manifestFile.FullName -Raw | ConvertFrom-Json
+            if ("$($manifest.publisher).$($manifest.name)" -match '(?i)github\.copilot') {
+              throw "Copilot extension remains in no-AI package: $($manifestFile.FullName)"
+            }
+          }
+
+          $bundleRoot = Join-Path $env:PACKAGE_DIR "resources/app/out"
+          if (-not (Test-Path $bundleRoot -PathType Container)) {
+            throw "Compiled workbench bundle directory is missing: $bundleRoot"
+          }
+          $bundleFiles = Get-ChildItem $bundleRoot -Recurse -File -Include "*.js", "*.mjs", "*.cjs"
+          $forbiddenRuntimeMarkers = @(
+            "https://main.vscode-cdn.net/extensions/copilotChat.json",
+            "inlineChat.start",
+            "workbench.action.chat.open"
+          )
+          foreach ($bundle in $bundleFiles) {
+            foreach ($marker in $forbiddenRuntimeMarkers) {
+              if (Select-String -Path $bundle.FullName -SimpleMatch $marker -Quiet) {
+                throw "AI runtime marker '$marker' remains in no-AI compiled bundle '$($bundle.FullName)'. The upstream dependency graph may have changed."
+              }
+            }
+          }
+          Write-Host "Verified no bundled Copilot extension, no Agents/Sessions bundle, and no checked core Chat/inline-Chat runtime markers in the no-AI package."
+
+      - name: Archive no-AI Linux build
         if: runner.os == 'Linux'
         shell: bash
         env:
-          PACKAGE_DIR: ${{ steps.package.outputs.path }}
-          NO_AI_PACKAGE: ${{ steps.no-ai-package.outputs.path }}
-          ARCHIVE_STANDARD: ${{ matrix.archive_standard }}
-          ARCHIVE_NO_AI: ${{ matrix.archive_no_ai }}
+          PACKAGE_DIR: ${{ steps.no-ai-package.outputs.path }}
+          ARCHIVE: ${{ matrix.archive_no_ai }}
         run: |
           set -euo pipefail
           test -d "$PACKAGE_DIR"
-          test -d "$NO_AI_PACKAGE"
+          tar -czf "$ARCHIVE" -C "$(dirname "$PACKAGE_DIR")" "$(basename "$PACKAGE_DIR")"
+          test -s "$ARCHIVE"
+          ls -lh "$ARCHIVE"
 
-          tar -czf "$ARCHIVE_STANDARD" \
-            -C "$(dirname "$PACKAGE_DIR")" "$(basename "$PACKAGE_DIR")"
-          tar -czf "$ARCHIVE_NO_AI" \
-            -C "$(dirname "$NO_AI_PACKAGE")" "$(basename "$NO_AI_PACKAGE")"
-
-          test -s "$ARCHIVE_STANDARD"
-          test -s "$ARCHIVE_NO_AI"
-          ls -lh "$ARCHIVE_STANDARD" "$ARCHIVE_NO_AI"
-
-      - name: Archive Windows builds
+      - name: Archive no-AI Windows build
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          PACKAGE_DIR: ${{ steps.package.outputs.path }}
-          NO_AI_PACKAGE: ${{ steps.no-ai-package.outputs.path }}
-          ARCHIVE_STANDARD: ${{ matrix.archive_standard }}
-          ARCHIVE_NO_AI: ${{ matrix.archive_no_ai }}
+          PACKAGE_DIR: ${{ steps.no-ai-package.outputs.path }}
+          ARCHIVE: ${{ matrix.archive_no_ai }}
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($path in @($env:PACKAGE_DIR, $env:NO_AI_PACKAGE)) {
-            if (-not (Test-Path $path -PathType Container)) {
-              throw "Build output directory not found: $path"
-            }
+          if (-not (Test-Path $env:PACKAGE_DIR -PathType Container)) {
+            throw "No-AI package directory not found: $env:PACKAGE_DIR"
           }
-
-          foreach ($archive in @($env:ARCHIVE_STANDARD, $env:ARCHIVE_NO_AI)) {
-            if (Test-Path $archive) {
-              Remove-Item $archive -Force
-            }
+          if (Test-Path $env:ARCHIVE) { Remove-Item $env:ARCHIVE -Force }
+          Compress-Archive -Path $env:PACKAGE_DIR -DestinationPath $env:ARCHIVE -CompressionLevel Optimal
+          if (-not (Test-Path $env:ARCHIVE -PathType Leaf) -or (Get-Item $env:ARCHIVE).Length -eq 0) {
+            throw "No-AI archive was not created or is empty: $env:ARCHIVE"
           }
-
-          Compress-Archive -Path $env:PACKAGE_DIR -DestinationPath $env:ARCHIVE_STANDARD -CompressionLevel Optimal
-          Compress-Archive -Path $env:NO_AI_PACKAGE -DestinationPath $env:ARCHIVE_NO_AI -CompressionLevel Optimal
-
-          foreach ($archive in @($env:ARCHIVE_STANDARD, $env:ARCHIVE_NO_AI)) {
-            if (-not (Test-Path $archive -PathType Leaf)) {
-              throw "Archive was not created: $archive"
-            }
-            if ((Get-Item $archive).Length -eq 0) {
-              throw "Archive is empty: $archive"
-            }
-            Write-Host "Created archive: $archive ($((Get-Item $archive).Length) bytes)"
-          }
+          Write-Host "Created no-AI archive: $env:ARCHIVE"
 
       - name: Upload platform archives
         uses: actions/upload-artifact@v7
@@ -783,7 +1252,7 @@ jobs:
 
     steps:
       - name: Download platform build artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: code-oss-*-${{ needs.check.outputs.tag }}
           path: release-assets
@@ -819,12 +1288,12 @@ jobs:
             Included builds:
             - Linux x64, standard with bundled Chat/BYOK: `code-oss-linux-x64.tar.gz`
             - Windows x64, standard with bundled Chat/BYOK: `code-oss-windows-x64.zip`
-            - Linux x64, no bundled Copilot AI extension: `code-oss-linux-x64-no-ai.tar.gz`
-            - Windows x64, no bundled Copilot AI extension: `code-oss-windows-x64-no-ai.zip`
+            - Linux x64, no bundled Copilot/Chat/agent runtime: `code-oss-linux-x64-no-ai.tar.gz`
+            - Windows x64, no bundled Copilot/Chat/agent runtime: `code-oss-windows-x64-no-ai.zip`
 
             The standard edition bundles the BYOK known-model catalogue locally, so it does not fetch `copilotChat.json` from Microsoft's CDN at startup.
 
-            The no-AI edition removes the bundled GitHub Copilot Chat extension and optional Copilot/AI endpoint metadata. It retains the required `defaultChatAgent` compatibility object because shared upstream workbench code dereferences it; generic chat APIs/workbench code and some Copilot-labelled core UI may still exist.
+            The no-AI edition is separately recompiled after removing core Chat, inline Chat, image-carousel, agent-session, remote-coding-agent, voice/dictation, MCP, agent-host, AI metadata-service and Copilot-connector entry-point imports. Its AI-based empty-editor hint is also removed. These import roots are pruned before compilation, so their implementation modules are not pulled into the main workbench bundles; the separate compiled Agents/Sessions bundle, bundled Copilot extension and Copilot SDK package (if packaged separately) are also removed from the no-AI package. Copilot/AI product metadata is stripped and the edition has its own application identity and data directory. This removes built-in AI functionality from the shipped application; users can still manually install third-party AI extensions from Open VSX unless you choose to block those extensions separately.
 
             `SHA256SUMS` contains SHA-256 checksums for all four archives.
           files: |
