@@ -93,7 +93,7 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-22.04 # older glibc = wider distro compatibility
+            os: ubuntu-latest # GCC 13: the Electron 43 / V8 headers do not compile with GCC 11 (ubuntu-22.04)
             platform: linux
           - name: win32-x64
             os: windows-2022
@@ -106,7 +106,6 @@ jobs:
       VSCODE_ARCH: x64
       OUT_DIR: VSCode-${{ matrix.platform }}-x64
       NODE_OPTIONS: --max-old-space-size=8192
-      npm_config_arch: x64
 
     steps:
       - name: Enable long paths (Windows)
@@ -114,7 +113,7 @@ jobs:
         run: git config --system core.longpaths true
 
       - name: Checkout upstream VS Code @ ${{ needs.prepare.outputs.tag }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.prepare.outputs.tag }}
@@ -122,12 +121,12 @@ jobs:
           fetch-depth: 1
 
       - name: Setup Node.js (version from upstream .nvmrc)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: vscode/.nvmrc
 
       - name: Setup Python (needed by node-gyp)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -148,7 +147,11 @@ jobs:
           sudo apt-get install -y \
             build-essential g++ pkg-config python-is-python3 jq \
             libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev \
-            fakeroot rpm dpkg-dev xz-utils
+            fakeroot rpm dpkg-dev xz-utils gcc-13 g++-13
+          # Make node-gyp use a compiler new enough for the Electron/V8 headers
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+          gcc-13 --version | head -n1
 
       # ---- Windows prerequisites ------------------------------------------
       - name: Install MSVC Spectre-mitigated libraries (Windows)
@@ -205,9 +208,10 @@ jobs:
         working-directory: vscode
         run: |
           ok=0
-          for attempt in 1 2 3; do
+          for attempt in 1 2; do
             if npm ci; then ok=1; break; fi
-            echo "::warning::npm ci failed (attempt ${attempt}/3), retrying..."
+            echo "::warning::npm ci failed (attempt ${attempt}/2), cleaning up and retrying..."
+            rm -rf node_modules
             sleep 20
           done
           [[ "$ok" == "1" ]]
@@ -294,7 +298,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/dist"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.name }}
           path: dist/*
