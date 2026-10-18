@@ -180,6 +180,26 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm install
 
+      # The root npm install does not install this extension's own dependency tree.
+      # Packaging calls prepareBuiltInCopilotRipgrepShim, which requires
+      # extensions/copilot/node_modules/@github/copilot/sdk to exist in the app.
+      - name: Install built-in Copilot extension dependencies
+        working-directory: vscode/extensions/copilot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm install
+
+      - name: Verify Copilot SDK dependency
+        working-directory: vscode/extensions/copilot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkPath = Join-Path $PWD "node_modules/@github/copilot/sdk"
+          if (-not (Test-Path $sdkPath -PathType Container)) {
+            throw "Copilot SDK is still missing after npm install: $sdkPath"
+          }
+          Write-Host "Copilot SDK dependency found at $sdkPath"
+
       - name: Build Linux archive, Debian package, and RPM package
         if: matrix.platform == 'linux-x64'
         working-directory: vscode
