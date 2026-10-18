@@ -25,6 +25,7 @@ jobs:
     outputs:
       changed: ${{ steps.release.outputs.changed }}
       tag: ${{ steps.release.outputs.tag }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -68,6 +69,7 @@ jobs:
     if: needs.check.outputs.changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
+
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +79,7 @@ jobs:
             task: vscode-linux-x64-min
             output: VSCode-linux-x64
             archive: code-oss-linux-x64.tar.gz
+
           - os: windows-2022
             platform: windows-x64
             task: vscode-win32-x64-min
@@ -121,7 +124,9 @@ jobs:
 
           $tool = if (Test-Path $kits) {
             Get-ChildItem $kits -Filter signtool.exe -Recurse -File |
-              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Where-Object {
+                $_.FullName -match '\\x64\\signtool\.exe$'
+              } |
               Sort-Object FullName -Descending |
               Select-Object -First 1
           }
@@ -141,10 +146,13 @@ jobs:
           $file = "build/gulpfile.vscode.ts"
           $source = Get-Content $file -Raw
 
-          # Replace the helper implementation, not the call site.
-          # This skips the Copilot SDK-dependent packaging operation.
           $pattern = '(?s)function prepareCopilotRipgrepShimTask\s*\([^)]*\)\s*\{.*?^\}'
-          if (-not [regex]::IsMatch($source, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)) {
+
+          if (-not [regex]::IsMatch(
+            $source,
+            $pattern,
+            [System.Text.RegularExpressions.RegexOptions]::Multiline
+          )) {
             throw "Could not find prepareCopilotRipgrepShimTask. Upstream source changed."
           }
 
@@ -183,10 +191,14 @@ jobs:
           }
 
           $product = Get-Content $file -Raw | ConvertFrom-Json
-          $product | Add-Member -NotePropertyName enableTelemetry `
-            -NotePropertyValue $false -Force
 
-          $product | ConvertTo-Json -Depth 100 |
+          $product | Add-Member `
+            -NotePropertyName enableTelemetry `
+            -NotePropertyValue $false `
+            -Force
+
+          $product |
+            ConvertTo-Json -Depth 100 |
             Set-Content $file -Encoding utf8
 
       - name: Build application
@@ -196,13 +208,88 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm run gulp ${{ matrix.task }}
 
-      - name: Remove built-in Copilot extension
+      - name: Inspect build output
         shell: pwsh
         env:
           OUTPUT_DIR: ${{ matrix.output }}
         run: |
           $ErrorActionPreference = "Stop"
-          $extensions = "vscode/$env:OUTPUT_DIR/resources/app/extensions"
+
+          Write-Host "Workspace: $PWD"
+          Write-Host "Expected output: $env:OUTPUT_DIR"
+
+          Write-Host "`nWorkspace directories:"
+          Get-ChildItem -Directory -Force |
+            Select-Object Name, FullName
+
+          Write-Host "`nRepository root directories:"
+          Get-ChildItem vscode -Directory -Force |
+            Select-Object Name, FullName
+
+          $expected = Join-Path $PWD $env:OUTPUT_DIR
+
+          if (Test-Path $expected -PathType Container) {
+            Write-Host "Found expected output: $expected"
+          } else {
+            Write-Host "Expected output not found at workspace root."
+
+            $candidate = Join-Path (Join-Path $PWD "vscode") $env:OUTPUT_DIR
+
+            if (Test-Path $candidate -PathType Container) {
+              Write-Host "Found output inside checkout: $candidate"
+            } else {
+              Write-Host "Searching for matching output directories..."
+
+              $matches = Get-ChildItem vscode -Directory -Recurse -Force `
+                -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -eq $env:OUTPUT_DIR }
+
+              if ($matches) {
+                $matches | Select-Object FullName
+              } else {
+                Write-Host "No directory named $env:OUTPUT_DIR was found."
+              }
+            }
+          }
+
+      - name: Resolve build output directory
+        id: package
+        shell: pwsh
+        env:
+          OUTPUT_DIR: ${{ matrix.output }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $candidates = @(
+            (Join-Path $PWD $env:OUTPUT_DIR),
+            (Join-Path (Join-Path $PWD "vscode") $env:OUTPUT_DIR)
+          )
+
+          $package = $null
+
+          foreach ($candidate in $candidates) {
+            if (Test-Path $candidate -PathType Container) {
+              $package = (Resolve-Path $candidate).Path
+              break
+            }
+          }
+
+          if (-not $package) {
+            throw "Build output '$env:OUTPUT_DIR' was not found in the workspace or checkout. See the Inspect build output step."
+          }
+
+          "path=$package" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved package directory: $package"
+
+      - name: Remove built-in Copilot extension
+        shell: pwsh
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $package = $env:PACKAGE_DIR
+          $extensions = Join-Path $package "resources/app/extensions"
           $copilot = Join-Path $extensions "copilot"
 
           if (Test-Path $copilot) {
@@ -215,20 +302,62 @@ jobs:
 
           Write-Host "Copilot extension excluded."
 
-      
       - name: Archive Linux build
         if: runner.os == 'Linux'
+        shell: bash
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.path }}
+          ARCHIVE: ${{ matrix.archive }}
         run: |
-          tar -czf "${{ matrix.archive }}" \
-            -C vscode "${{ matrix.output }}"
+          set -euo pipefail
+
+          if [ ! -d "$PACKAGE_DIR" ]; then
+            echo "Build output directory not found: $PACKAGE_DIR"
+            exit 1
+          fi
+
+          tar -czf "$ARCHIVE" \
+            -C "$(dirname "$PACKAGE_DIR")" \
+            "$(basename "$PACKAGE_DIR")"
+
+          test -s "$ARCHIVE"
+          echo "Created archive: $ARCHIVE"
+          ls -lh "$ARCHIVE"
 
       - name: Archive Windows build
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.path }}
+          ARCHIVE: ${{ matrix.archive }}
         run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path $env:PACKAGE_DIR -PathType Container)) {
+            throw "Build output directory not found: $env:PACKAGE_DIR"
+          }
+
+          if (Test-Path $env:ARCHIVE) {
+            Remove-Item $env:ARCHIVE -Force
+          }
+
           Compress-Archive `
-            -Path "vscode/${{ matrix.output }}" `
-            -DestinationPath "${{ matrix.archive }}"
+            -Path $env:PACKAGE_DIR `
+            -DestinationPath $env:ARCHIVE `
+            -CompressionLevel Optimal
+
+          if (-not (Test-Path $env:ARCHIVE -PathType Leaf)) {
+            throw "Archive was not created: $env:ARCHIVE"
+          }
+
+          $archiveInfo = Get-Item $env:ARCHIVE
+
+          if ($archiveInfo.Length -eq 0) {
+            throw "Archive is empty: $env:ARCHIVE"
+          }
+
+          Write-Host "Created archive: $($archiveInfo.FullName)"
+          Write-Host "Archive size: $($archiveInfo.Length) bytes"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -242,6 +371,7 @@ jobs:
     needs: [check, build]
     if: needs.check.outputs.changed == 'true'
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -250,10 +380,14 @@ jobs:
           UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -euo pipefail
+
           echo "$UPSTREAM_TAG" > .upstream-vscode-release
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add .upstream-vscode-release
+
           if ! git diff --cached --quiet; then
             git commit -m "chore: record upstream VS Code release"
             git push
