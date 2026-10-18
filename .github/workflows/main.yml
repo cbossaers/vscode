@@ -71,10 +71,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Use the same Ubuntu generation used by upstream VS Code CI.
-          # Ubuntu 26.04 currently hits a dpkg-shlibdeps / Dpkg::Shlibs::SymbolFile
-          # Perl compatibility failure during prepare-deb.
-          - os: ubuntu-22.04
+          # Ubuntu 24.04 provides GCC 13, required to compile Electron 43 V8
+          # headers used by native-keymap. Ubuntu 26.04 had a dpkg-shlibdeps
+          # failure during prepare-deb; avoid both toolchain issues with 24.04.
+          - os: ubuntu-24.04
             platform: linux-x64
           - os: windows-2022
             platform: windows-x64
@@ -100,7 +100,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential g++ libx11-dev libxkbfile-dev \
+            build-essential gcc-13 g++-13 libx11-dev libxkbfile-dev \
             libsecret-1-dev libkrb5-dev python-is-python3 pkg-config \
             fakeroot rpm
 
@@ -208,11 +208,38 @@ jobs:
             throw "Privacy defaults extension manifest was not written correctly."
           }
 
-      - name: Install npm dependencies
+      - name: Install npm dependencies (Linux)
+        if: runner.os == 'Linux'
         working-directory: vscode
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: npm install
+          # Electron 43's V8 headers need GCC 13 or newer. On Ubuntu 24.04,
+          # explicitly select GCC 13 for native-keymap and other native modules.
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          "$CC" --version
+          "$CXX" --version
+          npm install
+
+      - name: Install npm dependencies (Windows)
+        if: runner.os == 'Windows'
+        working-directory: vscode
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          node --version
+          npm --version
+          npm install
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm install failed."
+          }
 
       # The root npm install does not install this extension's own dependency tree.
       # Packaging calls prepareBuiltInCopilotRipgrepShim, which requires
@@ -304,6 +331,9 @@ jobs:
         if: matrix.platform == 'linux-x64'
         working-directory: vscode
         shell: bash
+        env:
+          CC: gcc-13
+          CXX: g++-13
         run: |
           set -euo pipefail
           export NODE_ENV=production
