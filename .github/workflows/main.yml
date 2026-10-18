@@ -4,6 +4,7 @@ name: Build Privacy-Hardened Code - OSS
 on:
   schedule:
     - cron: "23 5 * * *"
+
   workflow_dispatch:
     inputs:
       force:
@@ -23,6 +24,7 @@ jobs:
   check:
     name: Check upstream release
     runs-on: ubuntu-latest
+
     outputs:
       changed: ${{ steps.release.outputs.changed }}
       tag: ${{ steps.release.outputs.tag }}
@@ -33,10 +35,10 @@ jobs:
 
       - name: Find latest stable release
         id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FORCE: ${{ inputs.force }}
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
 
@@ -48,10 +50,10 @@ jobs:
               '[.[] | select(.draft == false and .prerelease == false)]
                | .[0].tag_name // empty')
 
-          test -n "$TAG" || {
-            echo "No stable release found"
+          if [ -z "$TAG" ]; then
+            echo "No stable upstream release found"
             exit 1
-          }
+          fi
 
           echo "Latest stable release: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -72,8 +74,9 @@ jobs:
     name: Build ${{ matrix.platform }}
     needs: check
     if: needs.check.outputs.changed == 'true'
+
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 150
 
     strategy:
       fail-fast: false
@@ -98,6 +101,7 @@ jobs:
           repository: microsoft/vscode
           ref: ${{ needs.check.outputs.tag }}
           path: vscode
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -124,7 +128,7 @@ jobs:
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install dependencies
+      - name: Install npm dependencies
         working-directory: vscode
         run: npm install
 
@@ -132,9 +136,12 @@ jobs:
         working-directory: vscode
         env:
           NODE_ENV: production
+          # The upstream build fetch helper reads this variable.
+          # It authenticates GitHub API requests for release assets.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run gulp ${{ matrix.task }}
 
-      - name: Harden packaged product configuration
+      - name: Harden product configuration
         shell: pwsh
         env:
           OUTPUT_DIR: ${{ matrix.output }}
@@ -146,17 +153,18 @@ jobs:
             "resources/app/product.json"
 
           if (-not (Test-Path $product)) {
-            throw "Expected product.json not found: $product"
+            throw "product.json not found: $product"
           }
 
           $config = Get-Content $product -Raw |
             ConvertFrom-Json
 
-          # Disable the legacy product telemetry flag.
-          $config.enableTelemetry = $false
+          $config | Add-Member `
+            -NotePropertyName enableTelemetry `
+            -NotePropertyValue $false `
+            -Force
 
-          $json = $config |
-            ConvertTo-Json -Depth 100
+          $json = $config | ConvertTo-Json -Depth 100
 
           [System.IO.File]::WriteAllText(
             (Resolve-Path $product).Path,
@@ -164,34 +172,31 @@ jobs:
             [System.Text.UTF8Encoding]::new($false)
           )
 
-          # Verify the change persisted.
-          $check = Get-Content $product -Raw |
+          $verify = Get-Content $product -Raw |
             ConvertFrom-Json
 
-          if ($check.enableTelemetry -ne $false) {
-            throw "Telemetry hardening verification failed"
+          if ($verify.enableTelemetry -ne $false) {
+            throw "Telemetry flag verification failed"
           }
 
-          Write-Host "Legacy product telemetry flag disabled."
-
-      - name: Create default privacy settings
+      - name: Create portable privacy settings
         shell: pwsh
         env:
           OUTPUT_DIR: ${{ matrix.output }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $app = "vscode/$env:OUTPUT_DIR/resources/app"
+          # Portable mode reads data/user-data/User/settings.json
+          # relative to the packaged application directory.
+          $settingsDir = Join-Path `
+            "vscode/$env:OUTPUT_DIR" `
+            "data/user-data/User"
 
-          # Ship a portable-mode profile with privacy settings.
-          $settingsDir = Join-Path $app "data/user-data/User"
           New-Item -ItemType Directory -Force `
             -Path $settingsDir | Out-Null
 
           $settings = @{
             "telemetry.telemetryLevel" = "off"
-            "telemetry.enableTelemetry" = $false
-            "telemetry.enableCrashReporter" = $false
             "telemetry.feedback.enabled" = $false
             "workbench.enableExperiments" = $false
             "update.mode" = "none"
@@ -199,7 +204,8 @@ jobs:
             "extensions.autoUpdate" = $false
           }
 
-          $settingsPath = Join-Path $settingsDir "settings.json"
+          $settingsPath = Join-Path `
+            $settingsDir "settings.json"
 
           $settings | ConvertTo-Json |
             Set-Content -Path $settingsPath -Encoding utf8
@@ -208,7 +214,7 @@ jobs:
             throw "Privacy settings were not created"
           }
 
-          Write-Host "Portable privacy profile created."
+          Write-Host "Portable privacy settings created."
 
       - name: Archive Linux build
         if: runner.os == 'Linux'
@@ -236,13 +242,14 @@ jobs:
     name: Record successful release
     needs: [check, build]
     if: needs.check.outputs.changed == 'true'
+
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout build repository
         uses: actions/checkout@v4
 
-      - name: Record upstream release
+      - name: Record release tag
         env:
           UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
         run: |
