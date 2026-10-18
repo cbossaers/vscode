@@ -93,7 +93,7 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-latest # GCC 13: the Electron 43 / V8 headers do not compile with GCC 11 (ubuntu-22.04)
+            os: ubuntu-24.04 # GCC 13: the Electron 43 / V8 headers do not compile with GCC 11 (ubuntu-22.04)
             platform: linux
           - name: win32-x64
             os: windows-2022
@@ -106,6 +106,7 @@ jobs:
       VSCODE_ARCH: x64
       OUT_DIR: VSCode-${{ matrix.platform }}-x64
       NODE_OPTIONS: --max-old-space-size=8192
+      NPM_CONFIG_LOGLEVEL: error
 
     steps:
       - name: Enable long paths (Windows)
@@ -113,7 +114,7 @@ jobs:
         run: git config --system core.longpaths true
 
       - name: Checkout upstream VS Code @ ${{ needs.prepare.outputs.tag }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.prepare.outputs.tag }}
@@ -121,12 +122,12 @@ jobs:
           fetch-depth: 1
 
       - name: Setup Node.js (version from upstream .nvmrc)
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version-file: vscode/.nvmrc
 
       - name: Setup Python (needed by node-gyp)
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -216,17 +217,52 @@ jobs:
           done
           [[ "$ok" == "1" ]]
 
+      # ---- Discover which gulp tasks this VS Code version actually has -----
+      # Upstream renames build tasks fairly often, so we ask gulp instead of
+      # hard-coding names. Helpers live next to (not inside) the vscode folder.
+      - name: Discover gulp tasks
+        working-directory: vscode
+        run: |
+          npm run --silent gulp -- --tasks-simple | grep -E '^[A-Za-z0-9:_.-]+$' | sort -u > ../.ci-gulp-tasks.txt
+          cat > ../.ci-helpers.sh <<'EOF'
+          TASKS_FILE="../.ci-gulp-tasks.txt"
+          has_task()   { grep -qxF -- "$1" "$TASKS_FILE"; }
+          first_task() { local t; for t in "$@"; do if has_task "$t"; then echo "$t"; return 0; fi; done; return 1; }
+          # run the first existing task from the candidates, or fail and show what exists
+          need_task() {
+            local t
+            t="$(first_task "$@")" || {
+              echo "::error::None of these gulp tasks exist in this VS Code version: $*"
+              echo "Available build-related tasks:"
+              grep -E 'compile|minify|core-ci|extension|vscode-|deb|rpm|setup|inno' "$TASKS_FILE" || cat "$TASKS_FILE"
+              return 1
+            }
+            echo "::group::gulp $t"; npm run gulp -- "$t"; echo "::endgroup::"
+          }
+          # same, but skip quietly if none exist
+          opt_task() { if first_task "$@" >/dev/null; then need_task "$@"; else echo "::warning::skipping optional gulp task: $*"; fi; }
+          EOF
+          echo "$(wc -l < ../.ci-gulp-tasks.txt) gulp tasks found. Build-related ones:"
+          grep -E 'compile|minify|core-ci|vscode-(linux|win32)-x64' ../.ci-gulp-tasks.txt || true
+
       # ---- Compile + package the app (portable directory) -----------------
       - name: Build VS Code
         working-directory: vscode
         env:
           GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when gulp downloads built-in extensions
         run: |
-          npm run gulp compile-build-without-mangling
-          npm run gulp compile-extension-media
-          npm run gulp compile-extensions-build
-          npm run gulp minify-vscode
-          npm run gulp "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci"
+          source ../.ci-helpers.sh
+          if first_task compile-build-without-mangling compile-build-with-mangling compile-build >/dev/null; then
+            need_task compile-build-without-mangling compile-build-with-mangling compile-build
+            opt_task  compile-extension-media
+            need_task compile-extensions-build
+            need_task minify-vscode
+          else
+            echo "::warning::No compile-build task found; falling back to core-ci-pr / core-ci"
+            need_task core-ci-pr core-ci
+            need_task compile-extensions-build
+          fi
+          need_task "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci" "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min"
 
       - name: Verify the built product.json contains our customisations
         run: |
@@ -246,6 +282,7 @@ jobs:
         working-directory: vscode
         run: |
           set -euo pipefail
+          source ../.ci-helpers.sh
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
           # Portable archive
@@ -253,12 +290,12 @@ jobs:
             -C "$GITHUB_WORKSPACE" "$OUT_DIR"
 
           # Debian / Ubuntu installer
-          npm run gulp "vscode-linux-${VSCODE_ARCH}-prepare-deb"
-          npm run gulp "vscode-linux-${VSCODE_ARCH}-build-deb"
+          need_task "vscode-linux-${VSCODE_ARCH}-prepare-deb"
+          need_task "vscode-linux-${VSCODE_ARCH}-build-deb"
 
           # Fedora / RHEL / openSUSE installer
-          npm run gulp "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
-          npm run gulp "vscode-linux-${VSCODE_ARCH}-build-rpm"
+          need_task "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
+          need_task "vscode-linux-${VSCODE_ARCH}-build-rpm"
 
           pick() {
             local f
@@ -276,12 +313,13 @@ jobs:
         working-directory: vscode
         run: |
           set -euo pipefail
+          source ../.ci-helpers.sh
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
           # Installer prerequisites + Inno Setup installers
-          npm run gulp "vscode-win32-${VSCODE_ARCH}-inno-updater"
-          npm run gulp "vscode-win32-${VSCODE_ARCH}-system-setup"
-          npm run gulp "vscode-win32-${VSCODE_ARCH}-user-setup"
+          need_task "vscode-win32-${VSCODE_ARCH}-inno-updater"
+          need_task "vscode-win32-${VSCODE_ARCH}-system-setup"
+          need_task "vscode-win32-${VSCODE_ARCH}-user-setup"
 
           pick() {
             local f
@@ -298,7 +336,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/dist"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.name }}
           path: dist/*
