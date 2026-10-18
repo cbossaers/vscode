@@ -291,7 +291,7 @@ jobs:
 
 
       - name: Download validated BYOK catalogue
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v7
         with:
           name: byok-known-model-catalogue-${{ needs.check.outputs.tag }}
           path: byok-catalogue
@@ -1031,33 +1031,101 @@ jobs:
           }
           [System.IO.File]::WriteAllText($sourcePath, $source, [System.Text.UTF8Encoding]::new($false))
 
-          # Keep runtime package metadata from advertising or installing the SDK.
+          # The build tooling still validates package.json.copilotRuntimeVersion
+          # against the installed SDK at gulp startup. Keep that build-time version
+          # pin, but remove the SDK dependency from the no-AI app manifest used by
+          # getProductionDependencies so it is not shipped.
           $packagePath = "package.json"
           $package = Get-Content $packagePath -Raw | ConvertFrom-Json
-          if ($null -ne $package.PSObject.Properties["copilotRuntimeVersion"]) {
-            [void]$package.PSObject.Properties.Remove("copilotRuntimeVersion")
+          if ([string]::IsNullOrWhiteSpace([string]$package.copilotRuntimeVersion)) {
+            throw "Upstream package.json no longer declares copilotRuntimeVersion; update the no-AI build compatibility patch."
           }
           foreach ($dependencyField in @("dependencies", "optionalDependencies")) {
-            $dependencies = $package.PSObject.Properties[$dependencyField]
-            if ($null -ne $dependencies -and $null -ne $dependencies.Value -and
-                $null -ne $dependencies.Value.PSObject.Properties["@github/copilot-sdk"]) {
-              [void]$dependencies.Value.PSObject.Properties.Remove("@github/copilot-sdk")
+            $dependenciesProperty = $package.PSObject.Properties[$dependencyField]
+            if ($null -eq $dependenciesProperty -or $null -eq $dependenciesProperty.Value) { continue }
+            foreach ($dependencyName in @($dependenciesProperty.Value.PSObject.Properties.Name)) {
+              if ($dependencyName -match '^@github/copilot-sdk(?:-|$)') {
+                [void]$dependenciesProperty.Value.PSObject.Properties.Remove($dependencyName)
+                Write-Host "Removed build-package dependency declaration: $dependencyName"
+              }
             }
           }
+          # Deliberately retain copilotRuntimeVersion above for the gulpfile's
+          # build-time consistency check. It is removed from the packaged app later.
           $packageJson = $package | ConvertTo-Json -Depth 100
           [System.IO.File]::WriteAllText($packagePath, $packageJson + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+
+          # Patch the packaging gulpfile for this second build only: keep its
+          # top-level version validator working, but do not stamp Copilot/agent
+          # metadata or copy Copilot SDK runtime packages into the no-AI product.
+          $gulpfilePath = "build/gulpfile.vscode.ts"
+          $gulpSource = [System.IO.File]::ReadAllText($gulpfilePath) -replace "`r`n", "`n"
+
+          $copilotVersionsPattern = '(?m)^([ \t]*)json\.copilotVersions\s*=\s*\{\s*\n[ \t]*runtime:\s*copilotRuntimeVersion,\s*\n[ \t]*sdk:\s*getLockedPackageVersion\(''@github/copilot-sdk''\),\s*\n[ \t]*\};'
+          if ([regex]::Matches($gulpSource, $copilotVersionsPattern).Count -ne 1) {
+            throw "Could not locate exactly one copilotVersions packaging block in $gulpfilePath."
+          }
+          $gulpSource = [regex]::Replace($gulpSource, $copilotVersionsPattern, '$1delete json.copilotVersions;', 1)
+
+          $agentSdkAssignment = 'json.agentSdks = agentSdks;'
+          if ([regex]::Matches($gulpSource, [regex]::Escape($agentSdkAssignment)).Count -ne 1) {
+            throw "Could not locate exactly one agentSdks product-stamping assignment in $gulpfilePath."
+          }
+          $gulpSource = $gulpSource.Replace($agentSdkAssignment, 'delete json.agentSdks;')
+
+          $dictationAssignment = 'json.dictationRuntime = dictationRuntime;'
+          if ([regex]::Matches($gulpSource, [regex]::Escape($dictationAssignment)).Count -ne 1) {
+            throw "Could not locate exactly one dictationRuntime product-stamping assignment in $gulpfilePath."
+          }
+          $gulpSource = $gulpSource.Replace($dictationAssignment, 'delete json.dictationRuntime;')
+
+          $prebuildLine = "const copilotRuntimePrebuilds = gulp.src(getCopilotRuntimePrebuildFiles(platform, arch), { base: '.', dot: true, allowEmpty: true });"
+          if ([regex]::Matches($gulpSource, [regex]::Escape($prebuildLine)).Count -ne 1) {
+            throw "Could not locate exactly one Copilot SDK prebuild packaging line in $gulpfilePath."
+          }
+          $gulpSource = $gulpSource.Replace($prebuildLine, "const copilotRuntimePrebuilds = process.env['CODE_OSS_NO_AI_BUILD'] === '1' ? es.readArray([]) : gulp.src(getCopilotRuntimePrebuildFiles(platform, arch), { base: '.', dot: true, allowEmpty: true });")
+
+          $ensureLine = 'ensureCopilotPlatformPackage(platform, arch);'
+          if ([regex]::Matches($gulpSource, [regex]::Escape($ensureLine)).Count -ne 1) {
+            throw "Could not locate exactly one ensureCopilotPlatformPackage call in $gulpfilePath."
+          }
+          $gulpSource = $gulpSource.Replace($ensureLine, "if (process.env['CODE_OSS_NO_AI_BUILD'] !== '1') { ensureCopilotPlatformPackage(platform, arch); }")
+
+          $productionLine = 'const productionDependencies = getProductionDependencies(root);'
+          if ([regex]::Matches($gulpSource, [regex]::Escape($productionLine)).Count -ne 1) {
+            throw "Could not locate exactly one production-dependency selection line in $gulpfilePath."
+          }
+          $productionReplacement = @'
+          const productionDependencies = getProductionDependencies(root).filter(dependencyPath => {
+            if (process.env['CODE_OSS_NO_AI_BUILD'] !== '1') {
+              return true;
+            }
+            const normalizedPath = dependencyPath.replace(/\\/g, '/');
+            return !/(^|\/)node_modules\/@github\/copilot-sdk(?:-[^/]+)?(?:\/|$)/i.test(normalizedPath);
+          });
+          '@
+          $productionReplacement = $productionReplacement.Trim()
+          $gulpSource = $gulpSource.Replace($productionLine, $productionReplacement)
+
+          if ($gulpSource.Contains('json.copilotVersions =') -or
+              $gulpSource.Contains('json.agentSdks = agentSdks;') -or
+              $gulpSource.Contains('json.dictationRuntime = dictationRuntime;')) {
+            throw "No-AI product metadata stamping remains in $gulpfilePath."
+          }
+          [System.IO.File]::WriteAllText($gulpfilePath, $gulpSource, [System.Text.UTF8Encoding]::new($false))
 
           $verified = [System.IO.File]::ReadAllText($sourcePath)
           if ($verified.Contains($blockMarker) -or $verified.Contains("copilotVersions:")) {
             throw "Product runtime source still contains Copilot runtime-version logic."
           }
-          Write-Host "Removed the runtime Copilot version fallback and SDK package metadata for the no-AI build."
+          Write-Host "Removed runtime Copilot fallback and patched no-AI packaging while preserving build-time SDK version validation."
 
       - name: Rebuild application without Chat and agent functionality
         working-directory: vscode
         env:
           NODE_ENV: production
           GITHUB_TOKEN: ${{ github.token }}
+          CODE_OSS_NO_AI_BUILD: '1'
         run: npm run gulp ${{ matrix.task }}
 
       - name: Resolve no-AI build output directory
@@ -1150,6 +1218,40 @@ jobs:
           if (Test-Path $sdkPath -PathType Container) { Remove-Item $sdkPath -Recurse -Force }
           if (Test-Path $sdkPath) { throw "Copilot SDK package remains in no-AI app: $sdkPath" }
 
+          # Check the packed production dependencies too. Most app dependencies
+          # are stored inside node_modules.asar rather than as loose directories.
+          $asarPath = Join-Path $env:PACKAGE_DIR "resources/app/node_modules.asar"
+          if (Test-Path $asarPath -PathType Leaf) {
+            $env:CODE_OSS_NODE_MODULES_ASAR = $asarPath
+            $env:CODE_OSS_ASAR_MODULE = Join-Path $PWD "vscode/node_modules/asar"
+            $asarScanScript = @'
+          const asar = require(process.env.CODE_OSS_ASAR_MODULE);
+          const entries = asar.listPackage(process.env.CODE_OSS_NODE_MODULES_ASAR);
+          const forbidden = entries.filter((entry) =>
+            /(^|\/)@github\/copilot-sdk(?:-[^/]+)?(?:\/|$)/i.test(entry)
+          );
+          if (forbidden.length) {
+            console.error("Copilot SDK entries remain in node_modules.asar:");
+            console.error(forbidden.slice(0, 30).join("\n"));
+            process.exit(1);
+          }
+          console.log("No Copilot SDK packages found in node_modules.asar.");
+          '@
+            $asarScanScript | node
+            if ($LASTEXITCODE -ne 0) {
+              throw "Copilot SDK content remains in the no-AI node_modules.asar archive."
+            }
+          }
+
+          $unpackedGithub = Join-Path $env:PACKAGE_DIR "resources/app/node_modules.asar.unpacked/@github"
+          if (Test-Path $unpackedGithub -PathType Container) {
+            $unpackedSdk = Get-ChildItem $unpackedGithub -Directory -Force |
+              Where-Object { $_.Name -match '^copilot-sdk(?:-|$)' }
+            if ($unpackedSdk) {
+              throw "Copilot SDK native/runtime package remains unpacked: $($unpackedSdk[0].FullName)"
+            }
+          }
+
           $productPath = Join-Path $env:PACKAGE_DIR "resources/app/product.json"
           $product = Get-Content $productPath -Raw | ConvertFrom-Json
           $forbiddenProperties = @(
@@ -1170,10 +1272,32 @@ jobs:
           if (Test-Path $appPackagePath -PathType Leaf) {
             $appPackage = Get-Content $appPackagePath -Raw | ConvertFrom-Json
             if ($null -ne $appPackage.PSObject.Properties["copilotRuntimeVersion"]) {
-              throw "Packaged app package.json still advertises copilotRuntimeVersion."
+              [void]$appPackage.PSObject.Properties.Remove("copilotRuntimeVersion")
             }
-            if ($null -ne $appPackage.dependencies -and $null -ne $appPackage.dependencies.PSObject.Properties["@github/copilot-sdk"]) {
-              throw "Packaged app still declares @github/copilot-sdk."
+            foreach ($dependencyField in @("dependencies", "optionalDependencies")) {
+              $dependenciesProperty = $appPackage.PSObject.Properties[$dependencyField]
+              if ($null -eq $dependenciesProperty -or $null -eq $dependenciesProperty.Value) { continue }
+              foreach ($dependencyName in @($dependenciesProperty.Value.PSObject.Properties.Name)) {
+                if ($dependencyName -match '^@github/copilot-sdk(?:-|$)') {
+                  [void]$dependenciesProperty.Value.PSObject.Properties.Remove($dependencyName)
+                }
+              }
+            }
+            $appPackageJson = $appPackage | ConvertTo-Json -Depth 100
+            [System.IO.File]::WriteAllText($appPackagePath, $appPackageJson + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+            $appPackage = Get-Content $appPackagePath -Raw | ConvertFrom-Json
+            if ($null -ne $appPackage.PSObject.Properties["copilotRuntimeVersion"]) {
+              throw "Packaged app package.json still advertises copilotRuntimeVersion after sanitization."
+            }
+            foreach ($dependencyField in @("dependencies", "optionalDependencies")) {
+              $dependenciesProperty = $appPackage.PSObject.Properties[$dependencyField]
+              if ($null -ne $dependenciesProperty -and $null -ne $dependenciesProperty.Value) {
+                foreach ($dependencyName in @($dependenciesProperty.Value.PSObject.Properties.Name)) {
+                  if ($dependencyName -match '^@github/copilot-sdk(?:-|$)') {
+                    throw "Packaged app still declares Copilot SDK dependency '$dependencyName'."
+                  }
+                }
+              }
             }
           }
 
@@ -1252,7 +1376,7 @@ jobs:
 
     steps:
       - name: Download platform build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v7
         with:
           pattern: code-oss-*-${{ needs.check.outputs.tag }}
           path: release-assets
