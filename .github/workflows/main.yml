@@ -109,6 +109,7 @@ jobs:
             task: vscode-linux-x64-min
             output: VSCode-linux-x64
             archive: code-oss-linux-x64.tar.gz
+            installer: code-oss-linux-x64.deb
 
           - os: windows-2022
             cache_os: windows
@@ -116,6 +117,7 @@ jobs:
             task: vscode-win32-x64-min
             output: VSCode-win32-x64
             archive: code-oss-windows-x64.zip
+            installer: code-oss-windows-x64-setup.exe
 
     steps:
       - name: Checkout upstream release
@@ -140,7 +142,7 @@ jobs:
           sudo apt-get install -y \
             build-essential g++ libx11-dev \
             libxkbfile-dev libsecret-1-dev \
-            libkrb5-dev python-is-python3 pkg-config
+            libkrb5-dev python-is-python3 pkg-config fakeroot rpm
 
       - name: Install Windows build tools
         if: runner.os == 'Windows'
@@ -524,6 +526,82 @@ jobs:
 
           Write-Host "Standard edition retains bundled Chat/BYOK and loads the known-model catalogue locally."
 
+      - name: Build Linux Debian installer
+        if: runner.os == 'Linux'
+        working-directory: vscode
+        shell: bash
+        env:
+          INSTALLER_PATH: ${{ github.workspace }}/${{ matrix.installer }}
+        run: |
+          set -euo pipefail
+
+          # Upstream provides native Debian packaging tasks. The prepare task
+          # assembles the package tree; build-deb turns it into a .deb installer.
+          npm run gulp vscode-linux-x64-prepare-deb
+          npm run gulp vscode-linux-x64-build-deb
+
+          mapfile -t packages < <(find .build/linux/deb/amd64/deb -maxdepth 1 -type f -name '*.deb' -print)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            printf 'Expected exactly one Debian package, found %s\n' "${#packages[@]}" >&2
+            printf '%s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+
+          cp "${packages[0]}" "$INSTALLER_PATH"
+          test -s "$INSTALLER_PATH"
+          file "$INSTALLER_PATH"
+
+      - name: Build Linux RPM installer (Fedora and RPM-based distributions)
+        if: runner.os == 'Linux'
+        working-directory: vscode
+        shell: bash
+        env:
+          INSTALLER_PATH: ${{ github.workspace }}/code-oss-linux-x64.rpm
+        run: |
+          set -euo pipefail
+
+          # Use upstream's RPM packaging tasks; the editor is compiled only once.
+          npm run gulp vscode-linux-x64-prepare-rpm
+          npm run gulp vscode-linux-x64-build-rpm
+
+          mapfile -t packages < <(find .build/linux/rpm -type f -name '*.rpm' -print)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            printf 'Expected exactly one RPM package, found %s\n' "${#packages[@]}" >&2
+            printf '%s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+
+          cp "${packages[0]}" "$INSTALLER_PATH"
+          test -s "$INSTALLER_PATH"
+          rpm --query --package "$INSTALLER_PATH"
+          echo "Created Fedora/RPM installer: $INSTALLER_PATH"
+
+      - name: Build Windows user installer
+        if: runner.os == 'Windows'
+        working-directory: vscode
+        shell: pwsh
+        env:
+          INSTALLER_PATH: ${{ github.workspace }}\${{ matrix.installer }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Use upstream's Inno Setup task so install/uninstall, shortcuts,
+          # file associations, and product-specific paths follow VS Code's packaging.
+          npm run gulp vscode-win32-x64-user-setup
+          if ($LASTEXITCODE -ne 0) { throw "Upstream Windows user installer task failed." }
+
+          $setupDir = Join-Path $PWD ".build/win32-x64/user-setup"
+          $setups = @(Get-ChildItem $setupDir -File -Filter "*.exe")
+          if ($setups.Count -ne 1) {
+            throw "Expected exactly one Windows setup executable in '$setupDir'; found $($setups.Count)."
+          }
+
+          Copy-Item -LiteralPath $setups[0].FullName -Destination $env:INSTALLER_PATH -Force
+          if (-not (Test-Path $env:INSTALLER_PATH -PathType Leaf) -or (Get-Item $env:INSTALLER_PATH).Length -eq 0) {
+            throw "Windows installer was not created: $env:INSTALLER_PATH"
+          }
+          Write-Host "Created installer: $env:INSTALLER_PATH"
+
       - name: Archive platform build
         shell: pwsh
         env:
@@ -553,7 +631,18 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
-          path: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.installer }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Linux RPM installer
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: code-oss-linux-rpm-${{ needs.check.outputs.tag }}
+          path: code-oss-linux-x64.rpm
           if-no-files-found: error
           retention-days: 30
 
@@ -575,10 +664,16 @@ jobs:
         run: |
           set -euo pipefail
           test -s release-assets/code-oss-linux-x64.tar.gz
+          test -s release-assets/code-oss-linux-x64.deb
+          test -s release-assets/code-oss-linux-x64.rpm
           test -s release-assets/code-oss-windows-x64.zip
+          test -s release-assets/code-oss-windows-x64-setup.exe
           sha256sum \
             release-assets/code-oss-linux-x64.tar.gz \
+            release-assets/code-oss-linux-x64.deb \
+            release-assets/code-oss-linux-x64.rpm \
             release-assets/code-oss-windows-x64.zip \
+            release-assets/code-oss-windows-x64-setup.exe \
             > release-assets/SHA256SUMS
           cat release-assets/SHA256SUMS
 
@@ -593,16 +688,22 @@ jobs:
 
             Upstream source: https://github.com/microsoft/vscode/releases/tag/${{ needs.check.outputs.tag }}
 
-            Included builds:
-            - Linux x64: `code-oss-linux-x64.tar.gz`
-            - Windows x64: `code-oss-windows-x64.zip`
+            Downloads:
+            - Linux x64 portable archive: `code-oss-linux-x64.tar.gz`
+            - Linux x64 Debian installer: `code-oss-linux-x64.deb`
+            - Linux x64 RPM installer (Fedora/RPM-based distributions): `code-oss-linux-x64.rpm`
+            - Windows x64 portable archive: `code-oss-windows-x64.zip`
+            - Windows x64 user installer: `code-oss-windows-x64-setup.exe`
 
             The bundled Copilot Chat/BYOK implementation is included, but `chat.disableAIFeatures` defaults to `true`, so built-in AI features start hidden/off for fresh profiles. Users can turn the setting off to enable those features. The BYOK known-model catalogue is bundled locally, so startup does not need to fetch `copilotChat.json` from Microsoft's CDN.
 
-            `SHA256SUMS` contains SHA-256 checksums for both archives.
+            `SHA256SUMS` contains SHA-256 checksums for all five downloads.
           files: |
             release-assets/code-oss-linux-x64.tar.gz
+            release-assets/code-oss-linux-x64.deb
+            release-assets/code-oss-linux-x64.rpm
             release-assets/code-oss-windows-x64.zip
+            release-assets/code-oss-windows-x64-setup.exe
             release-assets/SHA256SUMS
           draft: false
           prerelease: false
@@ -616,7 +717,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Record successfully built release
         env:
