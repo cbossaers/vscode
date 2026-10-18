@@ -1,0 +1,262 @@
+
+name: Build Privacy-Hardened Code - OSS
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the release was already built
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-code-oss-release-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.release.outputs.changed }}
+      tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Find latest stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/microsoft/vscode/releases?per_page=100" \
+            | jq -er \
+              '[.[] | select(.draft == false and .prerelease == false)]
+               | .[0].tag_name // empty')
+
+          test -n "$TAG" || {
+            echo "No stable release found"
+            exit 1
+          }
+
+          echo "Latest stable release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          OLD=""
+          if [ -f .upstream-vscode-release ]; then
+            OLD=$(cat .upstream-vscode-release)
+          fi
+
+          if [ "$TAG" != "$OLD" ] || [ "$FORCE" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No new release; skipping build."
+          fi
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x64
+            task: vscode-linux-x64-min
+            output: VSCode-linux-x64
+            archive: code-oss-linux-x64.tar.gz
+
+          - os: windows-2022
+            platform: windows-x64
+            task: vscode-win32-x64-min
+            output: VSCode-win32-x64
+            archive: code-oss-windows-x64.zip
+
+    steps:
+      - name: Checkout upstream release
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vscode
+          ref: ${{ needs.check.outputs.tag }}
+          path: vscode
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: vscode/.nvmrc
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            g++ \
+            libx11-dev \
+            libxkbfile-dev \
+            libsecret-1-dev \
+            libkrb5-dev \
+            python-is-python3 \
+            pkg-config
+
+      - name: Install Windows build tools
+        if: runner.os == 'Windows'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install dependencies
+        working-directory: vscode
+        run: npm install
+
+      - name: Build application
+        working-directory: vscode
+        env:
+          NODE_ENV: production
+        run: npm run gulp ${{ matrix.task }}
+
+      - name: Harden packaged product configuration
+        shell: pwsh
+        env:
+          OUTPUT_DIR: ${{ matrix.output }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $product = Join-Path `
+            "vscode/$env:OUTPUT_DIR" `
+            "resources/app/product.json"
+
+          if (-not (Test-Path $product)) {
+            throw "Expected product.json not found: $product"
+          }
+
+          $config = Get-Content $product -Raw |
+            ConvertFrom-Json
+
+          # Disable the legacy product telemetry flag.
+          $config.enableTelemetry = $false
+
+          $json = $config |
+            ConvertTo-Json -Depth 100
+
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path $product).Path,
+            $json,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          # Verify the change persisted.
+          $check = Get-Content $product -Raw |
+            ConvertFrom-Json
+
+          if ($check.enableTelemetry -ne $false) {
+            throw "Telemetry hardening verification failed"
+          }
+
+          Write-Host "Legacy product telemetry flag disabled."
+
+      - name: Create default privacy settings
+        shell: pwsh
+        env:
+          OUTPUT_DIR: ${{ matrix.output }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $app = "vscode/$env:OUTPUT_DIR/resources/app"
+
+          # Ship a portable-mode profile with privacy settings.
+          $settingsDir = Join-Path $app "data/user-data/User"
+          New-Item -ItemType Directory -Force `
+            -Path $settingsDir | Out-Null
+
+          $settings = @{
+            "telemetry.telemetryLevel" = "off"
+            "telemetry.enableTelemetry" = $false
+            "telemetry.enableCrashReporter" = $false
+            "telemetry.feedback.enabled" = $false
+            "workbench.enableExperiments" = $false
+            "update.mode" = "none"
+            "extensions.autoCheckUpdates" = $false
+            "extensions.autoUpdate" = $false
+          }
+
+          $settingsPath = Join-Path $settingsDir "settings.json"
+
+          $settings | ConvertTo-Json |
+            Set-Content -Path $settingsPath -Encoding utf8
+
+          if (-not (Test-Path $settingsPath)) {
+            throw "Privacy settings were not created"
+          }
+
+          Write-Host "Portable privacy profile created."
+
+      - name: Archive Linux build
+        if: runner.os == 'Linux'
+        run: |
+          tar -czf "${{ matrix.archive }}" \
+            -C vscode "${{ matrix.output }}"
+
+      - name: Archive Windows build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "vscode/${{ matrix.output }}" `
+            -DestinationPath "${{ matrix.archive }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+  record:
+    name: Record successful release
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Record upstream release
+        env:
+          UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "$UPSTREAM_TAG" > .upstream-vscode-release
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .upstream-vscode-release
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record upstream VS Code release"
+            git push
+          fi
