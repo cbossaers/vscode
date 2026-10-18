@@ -200,6 +200,38 @@ jobs:
           }
           Write-Host "Copilot SDK dependency found at $sdkPath"
 
+      - name: Preserve Copilot SDK during dependency packaging
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ignorePath = Join-Path $PWD "build/.moduleignore"
+          $sdkPath = Join-Path $PWD "extensions/copilot/node_modules/@github/copilot/sdk"
+
+          if (-not (Test-Path $sdkPath -PathType Container)) {
+            throw "Source Copilot SDK is missing: $sdkPath"
+          }
+          if (-not (Test-Path $ignorePath -PathType Leaf)) {
+            throw "Dependency exclusion file was not found: $ignorePath"
+          }
+
+          # The upstream rule @github/copilot/** strips this SDK from the
+          # packaged built-in extension, but prepareBuiltInCopilotRipgrepShim
+          # requires extensions/copilot/node_modules/@github/copilot/sdk.
+          # Keep the rest of @github/copilot filtered, re-including only sdk/.
+          $content = Get-Content $ignorePath -Raw
+          $includeRule = "!@github/copilot/sdk/**"
+          if ($content -notmatch '(?m)^!@github/copilot/sdk/\*\*/?$') {
+            $excludeMatch = [regex]::Match($content, '(?m)^@github/copilot/\*\*/?$')
+            if (-not $excludeMatch.Success) {
+              throw "Expected upstream @github/copilot/** exclusion was not found in build/.moduleignore."
+            }
+            $content = $content.Insert($excludeMatch.Index + $excludeMatch.Length, [Environment]::NewLine + $includeRule)
+            [System.IO.File]::WriteAllText($ignorePath, $content, [System.Text.UTF8Encoding]::new($false))
+          }
+
+          Write-Host "Preserved SDK packaging rule in build/.moduleignore: $includeRule"
+
       - name: Build Linux archive, Debian package, and RPM package
         if: matrix.platform == 'linux-x64'
         working-directory: vscode
