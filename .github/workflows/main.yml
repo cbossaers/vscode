@@ -275,7 +275,13 @@ jobs:
           export NODE_ENV=production
 
           npm run gulp vscode-linux-x64-min
+
+          # Current upstream defines prepare and build as separate Gulp tasks.
+          # The prepare tasks create the staging directories required by the build tasks.
+          npm run gulp vscode-linux-x64-prepare-deb
           npm run gulp vscode-linux-x64-build-deb
+
+          npm run gulp vscode-linux-x64-prepare-rpm
           npm run gulp vscode-linux-x64-build-rpm
 
           # The packaged application directory is one level above the source checkout.
