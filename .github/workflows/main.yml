@@ -27,7 +27,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check latest stable release
         id: release
@@ -74,7 +74,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-26.04
             platform: linux-x64
             task: vscode-linux-x64-min
             output: VSCode-linux-x64
@@ -88,7 +88,7 @@ jobs:
 
     steps:
       - name: Checkout upstream release
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: microsoft/vscode
           ref: ${{ needs.check.outputs.tag }}
@@ -96,7 +96,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: vscode/.nvmrc
           cache: npm
@@ -200,6 +200,109 @@ jobs:
           $product |
             ConvertTo-Json -Depth 100 |
             Set-Content $file -Encoding utf8
+
+      - name: Configure Open VSX marketplace and telemetry ceiling
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $file = "product.json"
+
+          if (-not (Test-Path $file)) {
+            throw "Source product.json not found."
+          }
+
+          $product = Get-Content $file -Raw | ConvertFrom-Json
+          if (-not $product.extensionsGallery) {
+            $product | Add-Member `
+              -NotePropertyName extensionsGallery `
+              -NotePropertyValue ([pscustomobject]@{}) `
+              -Force
+          }
+
+          $gallery = $product.extensionsGallery
+          $gallery | Add-Member -NotePropertyName serviceUrl -NotePropertyValue "https://open-vsx.org/vscode/gallery" -Force
+          $gallery | Add-Member -NotePropertyName itemUrl -NotePropertyValue "https://open-vsx.org/vscode/item" -Force
+          $gallery | Add-Member -NotePropertyName resourceUrlTemplate -NotePropertyValue "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}" -Force
+          $gallery | Add-Member -NotePropertyName extensionUrlTemplate -NotePropertyValue "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest" -Force
+
+          $trustedDomains = @($product.linkProtectionTrustedDomains | Where-Object { $_ })
+          if ($trustedDomains -notcontains "https://open-vsx.org") {
+            $trustedDomains += "https://open-vsx.org"
+          }
+          $product | Add-Member `
+            -NotePropertyName linkProtectionTrustedDomains `
+            -NotePropertyValue $trustedDomains `
+            -Force
+
+          # Product-level cap keeps built-in/participating telemetry disabled even if a setting is changed.
+          $product | Add-Member `
+            -NotePropertyName enabledTelemetryLevels `
+            -NotePropertyValue ([pscustomobject]@{ error = $false; usage = $false }) `
+            -Force
+
+          $product |
+            ConvertTo-Json -Depth 100 |
+            Set-Content $file -Encoding utf8
+
+      - name: Set privacy-preserving configuration defaults
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Replace-ExactlyOnce {
+            param(
+              [Parameter(Mandatory = $true)][string]$File,
+              [Parameter(Mandatory = $true)][string]$Pattern,
+              [Parameter(Mandatory = $true)][string]$Replacement
+            )
+
+            if (-not (Test-Path $File -PathType Leaf)) {
+              throw "Expected upstream source file not found: $File"
+            }
+
+            $source = [System.IO.File]::ReadAllText($File)
+            $regex = [regex]::new($Pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+            $matches = $regex.Matches($source)
+            if ($matches.Count -ne 1) {
+              throw "Expected exactly one setting default match in $File but found $($matches.Count). Upstream source may have changed."
+            }
+
+            $source = $regex.Replace($source, $Replacement, 1)
+            [System.IO.File]::WriteAllText($File, $source, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "Patched default in $File"
+          }
+
+          Replace-ExactlyOnce `
+            "src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts" `
+            "('extensions\.autoUpdate'\s*:\s*\{.*?\bdefault:\s*)'on'" `
+            ('$1' + "'off'")
+
+          Replace-ExactlyOnce `
+            "src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts" `
+            "('extensions\.autoCheckUpdates'\s*:\s*\{.*?\bdefault:\s*)true" `
+            '$1false'
+
+          Replace-ExactlyOnce `
+            "src/vs/platform/update/common/update.config.contribution.ts" `
+            "('update\.mode'\s*:\s*\{.*?\bdefault:\s*)'default'" `
+            ('$1' + "'none'")
+
+          Replace-ExactlyOnce `
+            "src/vs/platform/update/common/update.config.contribution.ts" `
+            "('update\.showReleaseNotes'\s*:\s*\{.*?\bdefault:\s*)true" `
+            '$1false'
+
+          Replace-ExactlyOnce `
+            "src/vs/platform/telemetry/common/telemetryService.ts" `
+            "\[TELEMETRY_SETTING_ID\]\s*:\s*\{.*?('default'\s*:\s*)TelemetryConfiguration\.ON" `
+            '$1TelemetryConfiguration.OFF'
+
+          Replace-ExactlyOnce `
+            "src/vs/platform/telemetry/common/telemetryService.ts" `
+            "\[TELEMETRY_OLD_SETTING_ID\]\s*:\s*\{.*?('default'\s*:\s*)true" `
+            '$1false'
 
       - name: Build application
         working-directory: vscode
@@ -360,20 +463,68 @@ jobs:
           Write-Host "Archive size: $($archiveInfo.Length) bytes"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
           path: ${{ matrix.archive }}
           if-no-files-found: error
           retention-days: 30
 
-  record:
+  release:
     needs: [check, build]
-    if: needs.check.outputs.changed == 'true'
+    if: needs.check.outputs.changed == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Download platform build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: code-oss-*-${{ needs.check.outputs.tag }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify archives and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s release-assets/code-oss-linux-x64.tar.gz
+          test -s release-assets/code-oss-windows-x64.zip
+          sha256sum release-assets/code-oss-linux-x64.tar.gz release-assets/code-oss-windows-x64.zip > release-assets/SHA256SUMS
+          cat release-assets/SHA256SUMS
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Code - OSS ${{ needs.check.outputs.tag }}
+          body: |
+            Privacy-hardened Code - OSS builds from the Microsoft VS Code upstream release `${{ needs.check.outputs.tag }}`.
+
+            Upstream source: https://github.com/microsoft/vscode/releases/tag/${{ needs.check.outputs.tag }}
+
+            Included builds:
+            - Linux x64: `code-oss-linux-x64.tar.gz`
+            - Windows x64: `code-oss-windows-x64.zip`
+
+            `SHA256SUMS` contains SHA-256 checksums for both archives.
+          files: |
+            release-assets/code-oss-linux-x64.tar.gz
+            release-assets/code-oss-windows-x64.zip
+            release-assets/SHA256SUMS
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+
+  record:
+    needs: [check, build, release]
+    if: needs.check.outputs.changed == 'true' && needs.build.result == 'success' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
 
       - name: Record successfully built release
         env:
