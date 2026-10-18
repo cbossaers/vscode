@@ -200,37 +200,71 @@ jobs:
           }
           Write-Host "Copilot SDK dependency found at $sdkPath"
 
-      - name: Preserve Copilot SDK during dependency packaging
+      - name: Preserve Copilot SDK metadata and files during dependency packaging
         working-directory: vscode
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $ignorePath = Join-Path $PWD "build/.moduleignore"
           $sdkPath = Join-Path $PWD "extensions/copilot/node_modules/@github/copilot/sdk"
+          $copilotPackageJson = Join-Path $PWD "extensions/copilot/node_modules/@github/copilot/package.json"
 
           if (-not (Test-Path $sdkPath -PathType Container)) {
             throw "Source Copilot SDK is missing: $sdkPath"
+          }
+          if (-not (Test-Path $copilotPackageJson -PathType Leaf)) {
+            throw "Source Copilot package.json is missing: $copilotPackageJson"
+          }
+          $copilotPackage = Get-Content $copilotPackageJson -Raw | ConvertFrom-Json
+          if (-not $copilotPackage.version) {
+            throw "Source @github/copilot/package.json does not contain a version."
           }
           if (-not (Test-Path $ignorePath -PathType Leaf)) {
             throw "Dependency exclusion file was not found: $ignorePath"
           }
 
-          # The upstream rule @github/copilot/** strips this SDK from the
-          # packaged built-in extension, but prepareBuiltInCopilotRipgrepShim
-          # requires extensions/copilot/node_modules/@github/copilot/sdk.
-          # Keep the rest of @github/copilot filtered, re-including only sdk/.
-          $content = Get-Content $ignorePath -Raw
-          $includeRule = "!@github/copilot/sdk/**"
-          if ($content -notmatch '(?m)^!@github/copilot/sdk/\*\*/?$') {
-            $excludeMatch = [regex]::Match($content, '(?m)^@github/copilot/\*\*/?$')
-            if (-not $excludeMatch.Success) {
-              throw "Expected upstream @github/copilot/** exclusion was not found in build/.moduleignore."
+          # The upstream @github/copilot/** rule removes the SDK and its parent
+          # package.json. The packaging shim needs BOTH: sdk/ for its files and
+          # package.json to read the exact @github/copilot version when selecting
+          # the matching native platform package.
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in (Get-Content $ignorePath)) { $lines.Add($line) }
+
+          $excludeIndex = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].Trim() -match '^@github/copilot/\*\*/?$') {
+              $excludeIndex = $i
+              break
             }
-            $content = $content.Insert($excludeMatch.Index + $excludeMatch.Length, [Environment]::NewLine + $includeRule)
-            [System.IO.File]::WriteAllText($ignorePath, $content, [System.Text.UTF8Encoding]::new($false))
+          }
+          if ($excludeIndex -lt 0) {
+            throw "Expected upstream @github/copilot/** exclusion was not found in build/.moduleignore."
           }
 
-          Write-Host "Preserved SDK packaging rule in build/.moduleignore: $includeRule"
+          $includeRules = @(
+            "!@github/copilot/package.json",
+            "!@github/copilot/sdk/**"
+          )
+          $inserted = 0
+          foreach ($rule in $includeRules) {
+            # A negation must appear AFTER the broad exclusion to take effect.
+            $presentAfterExclude = $false
+            for ($j = $excludeIndex + 1; $j -lt $lines.Count; $j++) {
+              if ($lines[$j].Trim() -eq $rule) {
+                $presentAfterExclude = $true
+                break
+              }
+            }
+            if (-not $presentAfterExclude) {
+              $lines.Insert($excludeIndex + 1 + $inserted, $rule)
+              $inserted++
+            }
+          }
+
+          [System.IO.File]::WriteAllLines($ignorePath, $lines, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Preserved Copilot packaging rules:"
+          Write-Host "  !@github/copilot/package.json"
+          Write-Host "  !@github/copilot/sdk/**"
 
       - name: Build Linux archive, Debian package, and RPM package
         if: matrix.platform == 'linux-x64'
