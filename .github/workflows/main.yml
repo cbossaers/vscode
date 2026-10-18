@@ -132,6 +132,49 @@ jobs:
         working-directory: vscode
         run: npm install
 
+      
+      - name: Disable built-in Copilot for privacy build
+        shell: pwsh
+        working-directory: vscode
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Remove Copilot from built-in extension lists.
+          $productPath = "product.json"
+          $product = Get-Content $productPath -Raw |
+            ConvertFrom-Json
+
+          foreach ($key in @("builtInExtensions", "builtInExtensionsAfterBuild")) {
+            if ($product.$key) {
+              $product.$key = @(
+                $product.$key | Where-Object {
+                  $_.name -ne "copilot" -and
+                  $_.name -ne "GitHub.copilot"
+                }
+              )
+            }
+          }
+
+          $product | ConvertTo-Json -Depth 100 |
+            Set-Content -Path $productPath -Encoding utf8
+
+          # Locate the task that invokes the Copilot shim.
+          $gulpFile = "build/gulpfile.vscode.ts"
+          $source = Get-Content $gulpFile -Raw
+
+          if ($source -notmatch "prepareBuiltInCopilotRipgrepShim") {
+            throw "Expected Copilot shim call was not found; upstream changed."
+          }
+
+          $source = $source -replace `
+            '(?m)^\s*prepareBuiltInCopilotRipgrepShim\([^;]*\);?\s*$',
+            '// Copilot omitted from privacy-focused build.'
+
+          Set-Content -Path $gulpFile -Value $source -Encoding utf8
+
+          Write-Host "Patched product configuration and Copilot packaging."
+
+
       - name: Build application
         working-directory: vscode
         env:
