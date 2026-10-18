@@ -204,6 +204,21 @@ jobs:
           echo "--- patched product.json (relevant keys) ---"
           jq '{extensionsGallery, configurationDefaults}' product.json
 
+      # Upstream bug microsoft/vscode#337976: build/.moduleignore strips @github/copilot/**
+      # from the from-source Copilot extension, but packaging then requires
+      # node_modules/@github/copilot/sdk to exist. Keep just the sdk/ subtree.
+      - name: Keep Copilot SDK when packaging (upstream #337976 workaround)
+        working-directory: vscode
+        run: |
+          f=build/.moduleignore
+          if [[ -f "$f" ]] && grep -qF '@github/copilot' "$f"; then
+            if ! grep -qxF '!@github/copilot/sdk/**' "$f"; then
+              printf '\n!@github/copilot/sdk/**\n' >> "$f"
+            fi
+          fi
+          echo "--- copilot rules in $f ---"
+          grep -n 'copilot' "$f" || echo "(none)"
+
       # ---- Install deps ----------------------------------------------------
       - name: npm ci
         working-directory: vscode
@@ -269,8 +284,14 @@ jobs:
           # It must run AFTER compile-extensions-build (which wipes .build/extensions) and BEFORE packaging.
           # (AI features are still switched off by default via chat.disableAIFeatures.)
           opt_task compile-copilot-extension-build
-          echo "Copilot extension build output:"
-          ls -la .build/extensions/copilot/node_modules/@github/copilot 2>&1 | head -n 15 || true
+          if has_task compile-copilot-extension-build; then
+            if [[ ! -d .build/extensions/copilot/node_modules/@github/copilot/sdk ]]; then
+              echo "::error::Copilot SDK folder missing after compile-copilot-extension-build"
+              ls -la .build/extensions/copilot/node_modules/@github 2>&1 || true
+              exit 1
+            fi
+            echo "Copilot SDK present: $(ls .build/extensions/copilot/node_modules/@github/copilot/sdk | head -n 8 | tr '\n' ' ')"
+          fi
 
           need_task "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci" "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min"
 
