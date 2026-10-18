@@ -215,30 +215,7 @@ jobs:
 
           Write-Host "Copilot extension excluded."
 
-      - name: Create portable privacy settings
-        shell: pwsh
-        env:
-          OUTPUT_DIR: ${{ matrix.output }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $root = "vscode/$env:OUTPUT_DIR"
-          if (-not (Test-Path $root)) {
-            throw "Package output not found: $root"
-          }
-
-          $dir = Join-Path $root "data/user-data/User"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-
-          @{
-            "telemetry.telemetryLevel" = "off"
-            "telemetry.feedback.enabled" = $false
-            "workbench.enableExperiments" = $false
-            "update.mode" = "none"
-            "extensions.autoCheckUpdates" = $false
-            "extensions.autoUpdate" = $false
-          } | ConvertTo-Json |
-            Set-Content (Join-Path $dir "settings.json") -Encoding utf8
-
+      
       - name: Archive Linux build
         if: runner.os == 'Linux'
         run: |
