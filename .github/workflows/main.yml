@@ -204,20 +204,17 @@ jobs:
           echo "--- patched product.json (relevant keys) ---"
           jq '{extensionsGallery, configurationDefaults}' product.json
 
-      # Upstream bug microsoft/vscode#337976: build/.moduleignore strips @github/copilot/**
-      # from the from-source Copilot extension, but packaging then requires
-      # node_modules/@github/copilot/sdk to exist. Keep just the sdk/ subtree.
-      - name: Keep Copilot SDK when packaging (upstream #337976 workaround)
+      # Recent VS Code bundles Copilot Chat as a built-in extension and packaging requires
+      # node_modules/@github/copilot/{package.json,sdk/} inside it. Upstream's CI gets exactly
+      # that layout from a pre-built VSIX; a from-source build has it stripped by the blanket
+      # `@github/copilot/**` rule in build/.moduleignore (microsoft/vscode#337976, layout
+      # described in #310156). Re-include those two paths so a from-source build ships the
+      # same files. This is a config change only - no upstream code is modified.
+      - name: Keep Copilot package.json + sdk/ in the packaged extension
         working-directory: vscode
         run: |
-          f=build/.moduleignore
-          if [[ -f "$f" ]] && grep -qF '@github/copilot' "$f"; then
-            if ! grep -qxF '!@github/copilot/sdk/**' "$f"; then
-              printf '\n!@github/copilot/sdk/**\n' >> "$f"
-            fi
-          fi
-          echo "--- copilot rules in $f ---"
-          grep -n 'copilot' "$f" || echo "(none)"
+          printf '\n!@github/copilot/package.json\n!@github/copilot/sdk/**\n' >> build/.moduleignore
+          grep -n 'copilot' build/.moduleignore
 
       # ---- Install deps ----------------------------------------------------
       - name: npm ci
@@ -232,68 +229,26 @@ jobs:
           done
           [[ "$ok" == "1" ]]
 
-      # ---- Discover which gulp tasks this VS Code version actually has -----
-      # Upstream renames build tasks fairly often, so we ask gulp instead of
-      # hard-coding names. Helpers live next to (not inside) the vscode folder.
-      - name: Discover gulp tasks
-        working-directory: vscode
-        run: |
-          npm run --silent gulp -- --tasks-simple | grep -E '^[A-Za-z0-9:_.-]+$' | sort -u > ../.ci-gulp-tasks.txt
-          cat > ../.ci-helpers.sh <<'EOF'
-          TASKS_FILE="../.ci-gulp-tasks.txt"
-          has_task()   { grep -qxF -- "$1" "$TASKS_FILE"; }
-          first_task() { local t; for t in "$@"; do if has_task "$t"; then echo "$t"; return 0; fi; done; return 1; }
-          # run the first existing task from the candidates, or fail and show what exists
-          need_task() {
-            local t
-            t="$(first_task "$@")" || {
-              echo "::error::None of these gulp tasks exist in this VS Code version: $*"
-              echo "Available build-related tasks:"
-              grep -E 'compile|minify|core-ci|extension|vscode-|deb|rpm|setup|inno' "$TASKS_FILE" || cat "$TASKS_FILE"
-              return 1
-            }
-            echo "::group::gulp $t"; npm run gulp -- "$t"; echo "::endgroup::"
-          }
-          # same, but skip quietly if none exist
-          opt_task() { if first_task "$@" >/dev/null; then need_task "$@"; else echo "::warning::skipping optional gulp task: $*"; fi; }
-          EOF
-          echo "$(wc -l < ../.ci-gulp-tasks.txt) gulp tasks found. Build-related ones:"
-          grep -E 'compile|minify|core-ci|vscode-(linux|win32)-x64' ../.ci-gulp-tasks.txt || true
-
       # ---- Compile + package the app (portable directory) -----------------
+      # Task names below are the ones present in VS Code 1.142 (see `gulp --tasks-simple`).
+      # If upstream renames one, gulp fails with "Task never defined" and this list needs updating.
       - name: Build VS Code
         working-directory: vscode
         env:
           GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when gulp downloads built-in extensions
         run: |
-          source ../.ci-helpers.sh
-          if first_task compile-build-without-mangling compile-build-with-mangling compile-build >/dev/null; then
-            need_task compile-build-without-mangling compile-build-with-mangling compile-build
-            opt_task  compile-extension-media
-            need_task compile-extensions-build
-            need_task minify-vscode
-          else
-            echo "::warning::No compile-build task found; falling back to core-ci-pr / core-ci"
-            need_task core-ci-pr core-ci
-            need_task compile-extensions-build
-          fi
-
-          # Newer VS Code bundles Copilot Chat as a built-in extension (extensions/copilot).
-          # Packaging expects its SDK folder (.build/extensions/copilot/node_modules/@github/copilot/sdk),
-          # which CI normally gets from a pre-built VSIX. For non-CI builds upstream provides this task.
-          # It must run AFTER compile-extensions-build (which wipes .build/extensions) and BEFORE packaging.
-          # (AI features are still switched off by default via chat.disableAIFeatures.)
-          opt_task compile-copilot-extension-build
-          if has_task compile-copilot-extension-build; then
-            if [[ ! -d .build/extensions/copilot/node_modules/@github/copilot/sdk ]]; then
-              echo "::error::Copilot SDK folder missing after compile-copilot-extension-build"
-              ls -la .build/extensions/copilot/node_modules/@github 2>&1 || true
+          npm run gulp -- core-ci
+          npm run gulp -- compile-extensions-build
+          # must run after compile-extensions-build (which wipes .build/extensions)
+          npm run gulp -- compile-copilot-extension-build
+          for f in package.json sdk; do
+            test -e ".build/extensions/copilot/node_modules/@github/copilot/$f" || {
+              echo "::error::.build/extensions/copilot/node_modules/@github/copilot/$f missing after compile-copilot-extension-build"
+              ls -la .build/extensions/copilot/node_modules/@github/copilot || true
               exit 1
-            fi
-            echo "Copilot SDK present: $(ls .build/extensions/copilot/node_modules/@github/copilot/sdk | head -n 8 | tr '\n' ' ')"
-          fi
-
-          need_task "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci" "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min"
+            }
+          done
+          npm run gulp -- "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci"
 
       - name: Verify the built product.json contains our customisations
         run: |
@@ -313,7 +268,6 @@ jobs:
         working-directory: vscode
         run: |
           set -euo pipefail
-          source ../.ci-helpers.sh
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
           # Portable archive
@@ -321,12 +275,12 @@ jobs:
             -C "$GITHUB_WORKSPACE" "$OUT_DIR"
 
           # Debian / Ubuntu installer
-          need_task "vscode-linux-${VSCODE_ARCH}-prepare-deb"
-          need_task "vscode-linux-${VSCODE_ARCH}-build-deb"
+          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-prepare-deb"
+          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-build-deb"
 
           # Fedora / RHEL / openSUSE installer
-          need_task "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
-          need_task "vscode-linux-${VSCODE_ARCH}-build-rpm"
+          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
+          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-build-rpm"
 
           pick() {
             local f
@@ -344,13 +298,12 @@ jobs:
         working-directory: vscode
         run: |
           set -euo pipefail
-          source ../.ci-helpers.sh
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
           # Installer prerequisites + Inno Setup installers
-          need_task "vscode-win32-${VSCODE_ARCH}-inno-updater"
-          need_task "vscode-win32-${VSCODE_ARCH}-system-setup"
-          need_task "vscode-win32-${VSCODE_ARCH}-user-setup"
+          npm run gulp -- "vscode-win32-${VSCODE_ARCH}-inno-updater"
+          npm run gulp -- "vscode-win32-${VSCODE_ARCH}-system-setup"
+          npm run gulp -- "vscode-win32-${VSCODE_ARCH}-user-setup"
 
           pick() {
             local f
