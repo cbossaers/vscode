@@ -869,6 +869,37 @@ jobs:
             throw "Only $removedTotal AI-related entry-point imports/registrations were removed; expected at least 100. Upstream may have changed; refusing to label this build AI-free."
           }
 
+          # The extension-host API bridge separately publishes vscode.editorChat.start
+          # as the inlineChat.start command. This is an API registration, not the
+          # inline-chat workbench implementation; remove the registration itself
+          # instead of treating its string in extensionHostProcess.js as a false
+          # positive or leaving the API callable in the no-AI edition.
+          $apiPath = "src/vs/workbench/api/common/extHostApiCommands.ts"
+          if (-not (Test-Path $apiPath -PathType Leaf)) {
+            throw "Expected extension-host API source not found: $apiPath"
+          }
+          $apiSource = [System.IO.File]::ReadAllText($apiPath) -replace "`r`n", "`n"
+
+          $inlineApiPattern = '(?s)// --- inline chat\s+new ApiCommand\(\s*''vscode\.editorChat\.start''\s*,\s*''inlineChat\.start''.*?ApiCommandResult\.Void\s*\)\s*,\s*(?=// --- extension prompt files)'
+          $inlineApiMatches = [regex]::Matches($apiSource, $inlineApiPattern).Count
+          if ($inlineApiMatches -ne 1) {
+            throw "Expected exactly one extension-host inline-chat API registration in $apiPath; found $inlineApiMatches. Upstream changed; refusing to produce a misleading no-AI build."
+          }
+          $apiSource = ([regex]::new($inlineApiPattern)).Replace($apiSource, '', 1)
+
+          $inlineTypesPattern = '(?s)type InlineChatEditorApiArg\s*=\s*\{.*?\};\s*type InlineChatRunOptions\s*=\s*\{.*?\};'
+          $inlineTypesMatches = [regex]::Matches($apiSource, $inlineTypesPattern).Count
+          if ($inlineTypesMatches -ne 1) {
+            throw "Expected exactly one inline-chat API type block in $apiPath; found $inlineTypesMatches. Upstream changed; refusing to produce a misleading no-AI build."
+          }
+          $apiSource = ([regex]::new($inlineTypesPattern)).Replace($apiSource, '', 1)
+
+          if ($apiSource -match 'vscode\.editorChat\.start|inlineChat\.start|InlineChatEditorApiArg|InlineChatRunOptions') {
+            throw "Inline-chat extension-host API identifiers remain in $apiPath after patching."
+          }
+          [System.IO.File]::WriteAllText($apiPath, $apiSource, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Removed the inline-chat extension-host API registration and its types from the no-AI source."
+
           Write-Host "Removed built-in Chat, inline Chat, model catalogue, MCP, voice, Copilot connector, remote/local agent host and dedicated Agent Sessions entry-point roots before recompilation."
 
       - name: Strip Copilot-specific product configuration for no-AI build
@@ -1314,19 +1345,27 @@ jobs:
             throw "Compiled workbench bundle directory is missing: $bundleRoot"
           }
           $bundleFiles = Get-ChildItem $bundleRoot -Recurse -File -Include "*.js", "*.mjs", "*.cjs"
+          # The remote catalogue URL is a strong runtime/network marker. Command
+          # identifiers alone are not reliable proof that AI implementation code
+          # is bundled, so validate the inline-chat API registration specifically
+          # in the extension-host process and do not fail on unrelated command IDs.
           $forbiddenRuntimeMarkers = @(
-            "https://main.vscode-cdn.net/extensions/copilotChat.json",
-            "inlineChat.start",
-            "workbench.action.chat.open"
+            "https://main.vscode-cdn.net/extensions/copilotChat.json"
           )
           foreach ($bundle in $bundleFiles) {
             foreach ($marker in $forbiddenRuntimeMarkers) {
               if (Select-String -Path $bundle.FullName -SimpleMatch $marker -Quiet) {
-                throw "AI runtime marker '$marker' remains in no-AI compiled bundle '$($bundle.FullName)'. The upstream dependency graph may have changed."
+                throw "AI network runtime marker '$marker' remains in no-AI compiled bundle '$($bundle.FullName)'. The upstream dependency graph may have changed."
               }
             }
           }
-          Write-Host "Verified no bundled Copilot extension, no Agents/Sessions bundle, and no checked core Chat/inline-Chat runtime markers in the no-AI package."
+
+          $extensionHostBundle = Join-Path $bundleRoot "vs/workbench/api/node/extensionHostProcess.js"
+          if ((Test-Path $extensionHostBundle -PathType Leaf) -and
+              (Select-String -Path $extensionHostBundle -SimpleMatch "inlineChat.start" -Quiet)) {
+            throw "Inline-chat extension-host API marker remains in '$extensionHostBundle' after its source registration was removed."
+          }
+          Write-Host "Verified no bundled Copilot extension, no Agents/Sessions bundle, no Microsoft BYOK catalogue URL, and no inline-chat extension-host API registration in the no-AI package."
 
       - name: Archive no-AI Linux build
         if: runner.os == 'Linux'
@@ -1438,7 +1477,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Record successfully built release
         env:
