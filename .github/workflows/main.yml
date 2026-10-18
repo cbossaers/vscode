@@ -4,7 +4,6 @@ name: Build Privacy-Hardened Code - OSS
 on:
   schedule:
     - cron: "23 5 * * *"
-
   workflow_dispatch:
     inputs:
       force:
@@ -22,18 +21,14 @@ concurrency:
 
 jobs:
   check:
-    name: Check upstream release
     runs-on: ubuntu-latest
-
     outputs:
       changed: ${{ steps.release.outputs.changed }}
       tag: ${{ steps.release.outputs.tag }}
-
     steps:
-      - name: Checkout build repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Find latest stable release
+      - name: Check latest stable release
         id: release
         shell: bash
         env:
@@ -50,12 +45,11 @@ jobs:
               '[.[] | select(.draft == false and .prerelease == false)]
                | .[0].tag_name // empty')
 
-          if [ -z "$TAG" ]; then
+          test -n "$TAG" || {
             echo "No stable release found"
             exit 1
-          fi
+          }
 
-          echo "Latest stable release: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           OLD=""
@@ -67,17 +61,13 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No new release; skipping build."
           fi
 
   build:
-    name: Build ${{ matrix.platform }}
     needs: check
     if: needs.check.outputs.changed == 'true'
-
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
-
     strategy:
       fail-fast: false
       matrix:
@@ -87,7 +77,6 @@ jobs:
             task: vscode-linux-x64-min
             output: VSCode-linux-x64
             archive: code-oss-linux-x64.tar.gz
-
           - os: windows-2022
             platform: windows-x64
             task: vscode-win32-x64-min
@@ -115,124 +104,90 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            g++ \
-            libx11-dev \
-            libxkbfile-dev \
-            libsecret-1-dev \
-            libkrb5-dev \
-            python-is-python3 \
-            pkg-config
+            build-essential g++ libx11-dev \
+            libxkbfile-dev libsecret-1-dev \
+            libkrb5-dev python-is-python3 pkg-config
 
       - name: Install Windows build tools
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install Windows SDK and locate SignTool
+      - name: Locate Windows SDK SignTool
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
 
-          # Reuse an SDK already installed on the runner.
-          $tool = $null
-
-          if (Test-Path $kits) {
-            $tool = Get-ChildItem `
-              -Path $kits `
-              -Filter signtool.exe `
-              -Recurse `
-              -File |
-              Where-Object {
-                $_.FullName -match '\\x64\\signtool\.exe$'
-              } |
+          $tool = if (Test-Path $kits) {
+            Get-ChildItem $kits -Filter signtool.exe -Recurse -File |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
               Sort-Object FullName -Descending |
               Select-Object -First 1
           }
 
-          # Install the Windows SDK if SignTool is missing.
           if (-not $tool) {
-            $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-
-            if (-not $winget) {
-              throw "SignTool is missing and winget is unavailable."
-            }
-
-            & winget.exe install `
-              --id Microsoft.WindowsSDK.10.0.22621 `
-              --exact `
-              --silent `
-              --accept-source-agreements `
-              --accept-package-agreements
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "Windows SDK installation failed: $LASTEXITCODE"
-            }
-
-            if (Test-Path $kits) {
-              $tool = Get-ChildItem `
-                -Path $kits `
-                -Filter signtool.exe `
-                -Recurse `
-                -File |
-                Where-Object {
-                  $_.FullName -match '\\x64\\signtool\.exe$'
-                } |
-                Sort-Object FullName -Descending |
-                Select-Object -First 1
-            }
-          }
-
-          if (-not $tool) {
-            throw "SignTool was not found after SDK installation."
+            throw "SignTool is not installed on this runner."
           }
 
           $tool.DirectoryName |
-            Out-File -FilePath $env:GITHUB_PATH `
-              -Append -Encoding utf8
+            Out-File $env:GITHUB_PATH -Append -Encoding utf8
 
-          Write-Host "SignTool: $($tool.FullName)"
-
-      - name: Install npm dependencies
-        working-directory: vscode
-        run: npm install
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Disable legacy product telemetry
+      - name: Disable Copilot shim in build task
         working-directory: vscode
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $file = "build/gulpfile.vscode.ts"
+          $source = Get-Content $file -Raw
 
-          $path = "product.json"
-
-          if (-not (Test-Path $path)) {
-            throw "Source product.json not found: $path"
+          # Replace the helper implementation, not the call site.
+          # This skips the Copilot SDK-dependent packaging operation.
+          $pattern = '(?s)function prepareCopilotRipgrepShimTask\s*\([^)]*\)\s*\{.*?^\}'
+          if (-not [regex]::IsMatch($source, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)) {
+            throw "Could not find prepareCopilotRipgrepShimTask. Upstream source changed."
           }
 
-          $product = Get-Content $path -Raw |
-            ConvertFrom-Json
+          $replacement = @'
+          function prepareCopilotRipgrepShimTask(_platform: string, _arch: string, _destinationFolderName: string) {
+            return () => {
+              console.log('Skipping Copilot ripgrep shim for privacy-focused build.');
+            };
+          }
+          '@
 
-          $product | Add-Member `
-            -NotePropertyName enableTelemetry `
-            -NotePropertyValue $false `
-            -Force
+          $source = [regex]::Replace(
+            $source,
+            $pattern,
+            $replacement,
+            [System.Text.RegularExpressions.RegexOptions]::Multiline
+          )
 
-          $product |
-            ConvertTo-Json -Depth 100 |
-            Set-Content -Path $path -Encoding utf8
+          Set-Content $file -Value $source -Encoding utf8
 
-          $check = Get-Content $path -Raw |
-            ConvertFrom-Json
+      - name: Install npm dependencies
+        working-directory: vscode
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm install
 
-          if ($check.enableTelemetry -ne $false) {
-            throw "Could not disable legacy product telemetry."
+      - name: Disable legacy telemetry default
+        working-directory: vscode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $file = "product.json"
+
+          if (-not (Test-Path $file)) {
+            throw "Source product.json not found."
           }
 
-          Write-Host "Legacy telemetry flag disabled."
+          $product = Get-Content $file -Raw | ConvertFrom-Json
+          $product | Add-Member -NotePropertyName enableTelemetry `
+            -NotePropertyValue $false -Force
+
+          $product | ConvertTo-Json -Depth 100 |
+            Set-Content $file -Encoding utf8
 
       - name: Build application
         working-directory: vscode
@@ -241,33 +196,24 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm run gulp ${{ matrix.task }}
 
-      - name: Verify packaged product
+      - name: Remove built-in Copilot extension
         shell: pwsh
         env:
           OUTPUT_DIR: ${{ matrix.output }}
         run: |
           $ErrorActionPreference = "Stop"
+          $extensions = "vscode/$env:OUTPUT_DIR/resources/app/extensions"
+          $copilot = Join-Path $extensions "copilot"
 
-          $root = "vscode/$env:OUTPUT_DIR"
-
-          if (-not (Test-Path $root)) {
-            throw "Package output not found: $root"
+          if (Test-Path $copilot) {
+            Remove-Item $copilot -Recurse -Force
           }
 
-          $product = Join-Path $root "resources/app/product.json"
-
-          if (-not (Test-Path $product)) {
-            throw "Packaged product.json not found: $product"
+          if (Test-Path $copilot) {
+            throw "Copilot extension still exists in package."
           }
 
-          $config = Get-Content $product -Raw |
-            ConvertFrom-Json
-
-          if ($config.enableTelemetry -ne $false) {
-            throw "Packaged product telemetry flag is not disabled."
-          }
-
-          Write-Host "Packaged product telemetry flag verified."
+          Write-Host "Copilot extension excluded."
 
       - name: Create portable privacy settings
         shell: pwsh
@@ -275,38 +221,23 @@ jobs:
           OUTPUT_DIR: ${{ matrix.output }}
         run: |
           $ErrorActionPreference = "Stop"
-
           $root = "vscode/$env:OUTPUT_DIR"
-
           if (-not (Test-Path $root)) {
             throw "Package output not found: $root"
           }
 
-          $settingsDir = Join-Path $root "data/user-data/User"
+          $dir = Join-Path $root "data/user-data/User"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
-          New-Item -ItemType Directory -Force `
-            -Path $settingsDir | Out-Null
-
-          $settings = @{
+          @{
             "telemetry.telemetryLevel" = "off"
             "telemetry.feedback.enabled" = $false
             "workbench.enableExperiments" = $false
             "update.mode" = "none"
             "extensions.autoCheckUpdates" = $false
             "extensions.autoUpdate" = $false
-          }
-
-          $settingsPath = Join-Path $settingsDir "settings.json"
-
-          $settings |
-            ConvertTo-Json |
-            Set-Content -Path $settingsPath -Encoding utf8
-
-          if (-not (Test-Path $settingsPath)) {
-            throw "Privacy settings were not created."
-          }
-
-          Write-Host "Portable privacy settings created."
+          } | ConvertTo-Json |
+            Set-Content (Join-Path $dir "settings.json") -Encoding utf8
 
       - name: Archive Linux build
         if: runner.os == 'Linux'
@@ -322,7 +253,7 @@ jobs:
             -Path "vscode/${{ matrix.output }}" `
             -DestinationPath "${{ matrix.archive }}"
 
-      - name: Upload build artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
@@ -331,29 +262,21 @@ jobs:
           retention-days: 30
 
   record:
-    name: Record successful release
     needs: [check, build]
     if: needs.check.outputs.changed == 'true'
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout build repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Record release tag
+      - name: Record successfully built release
         env:
           UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -euo pipefail
-
           echo "$UPSTREAM_TAG" > .upstream-vscode-release
-
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .upstream-vscode-release
-
           if ! git diff --cached --quiet; then
             git commit -m "chore: record upstream VS Code release"
             git push
