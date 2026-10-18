@@ -1,520 +1,356 @@
-name: Build Privacy-Hardened Code - OSS
+name: Build VS Code (Windows + Linux)
+
+# Place this file at .github/workflows/build-vscode.yml in YOUR repo.
+# It clones microsoft/vscode at an upstream tag, patches product.json
+# (Open VSX marketplace + privacy-friendly defaults), builds, packages
+# and publishes a GitHub release tagged exactly like the upstream tag.
 
 on:
   schedule:
-    - cron: "23 5 * * *"
+    - cron: "0 */6 * * *" # poll for new upstream tags every 6 hours
   workflow_dispatch:
     inputs:
+      upstream_tag:
+        description: "Upstream microsoft/vscode tag to build (blank = latest stable tag)"
+        required: false
+        type: string
       force:
-        description: Rebuild and refresh the release even if this upstream tag was already built
+        description: "Rebuild even if a release for this tag already exists"
+        required: false
         type: boolean
         default: false
-        required: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: upstream-code-oss-release-build
+  group: build-vscode-${{ inputs.upstream_tag || 'latest' }}
   cancel-in-progress: false
 
+env:
+  UPSTREAM_REPO: microsoft/vscode
+
 jobs:
-  check:
+  # ---------------------------------------------------------------------------
+  # 1. Decide which upstream tag to build, and whether we already released it
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Resolve upstream tag
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.release.outputs.changed }}
-      tag: ${{ steps.release.outputs.tag }}
-
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Check latest stable upstream release
-        id: release
-        shell: bash
+      - name: Resolve tag and check for an existing release
+        id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
+          URL="https://github.com/${UPSTREAM_REPO}.git"
 
-          TAG=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/microsoft/vscode/releases/latest" \
-            | jq -er '.tag_name // empty')
-
-          test -n "$TAG" || {
-            echo "No stable upstream release found" >&2
-            exit 1
-          }
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-          OLD=""
-          if [ -f .upstream-vscode-release ]; then
-            OLD=$(cat .upstream-vscode-release)
-          fi
-
-          if [ "$TAG" != "$OLD" ] || [ "$FORCE" = "true" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG}"
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            # Newest plain X.Y.Z tag (ignores insiders / pre-release style tags)
+            TAG="$(git ls-remote --tags --refs "$URL" \
+              | awk '{print $2}' | sed 's#refs/tags/##' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          fi
+          [[ -n "$TAG" ]] || { echo "::error::Could not determine upstream tag"; exit 1; }
+
+          # Make sure the tag really exists upstream and grab its commit
+          COMMIT="$(git ls-remote --tags "$URL" "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -n1 | cut -f1)"
+          [[ -n "$COMMIT" ]] || { echo "::error::Tag ${TAG} not found in ${UPSTREAM_REPO}"; exit 1; }
+
+          SHOULD_BUILD=true
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ "${FORCE:-false}" != "true" ]]; then
+              echo "Release ${TAG} already exists - nothing to do."
+              SHOULD_BUILD=false
+            fi
           fi
 
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: ${TAG} (${COMMIT}) -> build=${SHOULD_BUILD}"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build + package on Linux and Windows
+  # ---------------------------------------------------------------------------
   build:
-    needs: check
-    if: needs.check.outputs.changed == 'true'
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
-
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          # Ubuntu 24.04 provides GCC 13, required to compile Electron 43 V8
-          # headers used by native-keymap. Ubuntu 26.04 had a dpkg-shlibdeps
-          # failure during prepare-deb; avoid both toolchain issues with 24.04.
-          - os: ubuntu-24.04
-            platform: linux-x64
-          - os: windows-2022
-            platform: windows-x64
+          - name: linux-x64
+            os: ubuntu-22.04 # older glibc = wider distro compatibility
+            platform: linux
+          - name: win32-x64
+            os: windows-2022
+            platform: win32
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VSCODE_ARCH: x64
+      OUT_DIR: VSCode-${{ matrix.platform }}-x64
+      NODE_OPTIONS: --max-old-space-size=8192
+      npm_config_arch: x64
 
     steps:
-      - name: Checkout upstream release
-        uses: actions/checkout@v7
-        with:
-          repository: microsoft/vscode
-          ref: ${{ needs.check.outputs.tag }}
-          path: vscode
-          persist-credentials: false
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
+      - name: Checkout upstream VS Code @ ${{ needs.prepare.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          path: vscode
+          fetch-depth: 1
+
+      - name: Setup Node.js (version from upstream .nvmrc)
+        uses: actions/setup-node@v4
         with:
           node-version-file: vscode/.nvmrc
-          cache: npm
-          cache-dependency-path: vscode/package-lock.json
 
-      - name: Install Linux build and package dependencies
+      - name: Setup Python (needed by node-gyp)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python setuptools
+        run: python -m pip install --upgrade pip setuptools
+
+      # ---- Linux prerequisites (from the CONTRIBUTING prerequisites) -------
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential gcc-13 g++-13 libx11-dev libxkbfile-dev \
-            libsecret-1-dev libkrb5-dev python-is-python3 pkg-config \
-            fakeroot rpm
+            build-essential g++ pkg-config python-is-python3 jq \
+            libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev \
+            fakeroot rpm dpkg-dev xz-utils
 
-      - name: Set up Windows build tools
-        if: runner.os == 'Windows'
-        uses: microsoft/setup-msbuild@v2
-
-      # VS Code's Windows packaging invokes signtool.exe by name. The SDK may be
-      # installed on the runner without its directory being on PATH.
-      - name: Locate Windows SDK SignTool
+      # ---- Windows prerequisites ------------------------------------------
+      - name: Install MSVC Spectre-mitigated libraries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
-          $tool = $null
-
-          if (Test-Path $kits) {
-            $tools = @(Get-ChildItem $kits -Filter signtool.exe -Recurse -File -ErrorAction SilentlyContinue)
-            $tool = $tools |
-              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-
-            if (-not $tool) {
-              $tool = $tools |
-                Where-Object { $_.FullName -match '\\App Certification Kit\\signtool\.exe$' } |
-                Select-Object -First 1
-            }
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $installPath = & "$installerDir\vswhere.exe" -latest -products * -property installationPath
+          $vsArgs = @(
+            "modify", "--installPath", "`"$installPath`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre",
+            "--add", "Microsoft.VisualStudio.Component.VC.ATL.Spectre",
+            "--add", "Microsoft.VisualStudio.Component.VC.ATLMFC.Spectre",
+            "--quiet", "--norestart", "--nocache"
+          )
+          $p = Start-Process -FilePath "$installerDir\setup.exe" -ArgumentList $vsArgs -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "Visual Studio installer failed with exit code $($p.ExitCode)"
           }
 
-          if (-not $tool) {
-            throw "signtool.exe was not found under '$kits'. Ensure the Windows SDK Signing Tools are installed."
-          }
-
-          $tool.DirectoryName | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-          Write-Host "Using SignTool: $($tool.FullName)"
-
-      # Code - OSS does not expose a supported product.json field for arbitrary
-      # configuration defaults. A tiny built-in extension contributes the defaults
-      # so they are included in the Linux and Windows packages alike.
-      - name: Configure Open VSX and add privacy defaults
+      # ---- Customise product.json -----------------------------------------
+      # * extensionsGallery -> Open VSX (the FOSS VSIX marketplace)
+      # * configurationDefaults -> build-time default values for the settings
+      #   (users can still override them in their own settings.json)
+      - name: Patch product.json (Open VSX + default settings)
         working-directory: vscode
-        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          cp product.json product.json.orig
+          jq '
+            .extensionsGallery = {
+              serviceUrl: "https://open-vsx.org/vscode/gallery",
+              itemUrl: "https://open-vsx.org/vscode/item",
+              extensionUrlTemplate: "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
+              resourceUrlTemplate: "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
+              controlUrl: "",
+              nlsBaseUrl: "",
+              publisherUrl: ""
+            }
+            | .configurationDefaults = ((.configurationDefaults // {}) + {
+                "extensions.autoCheckUpdates": false,
+                "extensions.autoUpdate": false,
+                "update.mode": "none",
+                "update.showReleaseNotes": false,
+                "telemetry.telemetryLevel": "off",
+                "chat.disableAIFeatures": true
+              })
+          ' product.json.orig > product.json
+          rm product.json.orig
+          echo "--- patched product.json (relevant keys) ---"
+          jq '{extensionsGallery, configurationDefaults}' product.json
 
-          $productPath = Join-Path $PWD "product.json"
-          if (-not (Test-Path $productPath -PathType Leaf)) {
-            throw "product.json was not found."
-          }
+      # ---- Install deps ----------------------------------------------------
+      - name: npm ci
+        working-directory: vscode
+        run: |
+          ok=0
+          for attempt in 1 2 3; do
+            if npm ci; then ok=1; break; fi
+            echo "::warning::npm ci failed (attempt ${attempt}/3), retrying..."
+            sleep 20
+          done
+          [[ "$ok" == "1" ]]
 
-          $product = Get-Content $productPath -Raw | ConvertFrom-Json -AsHashtable
+      # ---- Compile + package the app (portable directory) -----------------
+      - name: Build VS Code
+        working-directory: vscode
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when gulp downloads built-in extensions
+        run: |
+          npm run gulp compile-build-without-mangling
+          npm run gulp compile-extension-media
+          npm run gulp compile-extensions-build
+          npm run gulp minify-vscode
+          npm run gulp "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci"
 
-          # The settings default is also contributed by the built-in extension below.
-          # These product-level switches additionally disable telemetry collection.
-          $product["enableTelemetry"] = $false
-          $product["enabledTelemetryLevels"] = @{
-            error = $false
-            usage = $false
-          }
+      - name: Verify the built product.json contains our customisations
+        run: |
+          jq -e '
+            .extensionsGallery.serviceUrl == "https://open-vsx.org/vscode/gallery"
+            and .configurationDefaults["extensions.autoCheckUpdates"] == false
+            and .configurationDefaults["extensions.autoUpdate"] == false
+            and .configurationDefaults["update.mode"] == "none"
+            and .configurationDefaults["update.showReleaseNotes"] == false
+            and .configurationDefaults["telemetry.telemetryLevel"] == "off"
+            and .configurationDefaults["chat.disableAIFeatures"] == true
+          ' "${OUT_DIR}/resources/app/product.json"
 
-          $product["extensionsGallery"] = @{
-            serviceUrl = "https://open-vsx.org/vscode/gallery"
-            itemUrl = "https://open-vsx.org/vscode/item"
-            resourceUrlTemplate = "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"
-            extensionUrlTemplate = "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest"
-          }
-          $product["linkProtectionTrustedDomains"] = @("https://open-vsx.org")
-
-          $product | ConvertTo-Json -Depth 100 | Set-Content $productPath -Encoding utf8
-
-          $extensionDir = Join-Path $PWD "extensions/privacy-defaults"
-          New-Item -ItemType Directory -Path $extensionDir -Force | Out-Null
-
-          $defaults = @{
-            "extensions.autoCheckUpdates" = $false
-            "extensions.autoUpdate" = $false
-            "update.mode" = "none"
-            "update.showReleaseNotes" = $false
-            "telemetry.telemetryLevel" = "off"
-            "chat.disableAIFeatures" = $true
-          }
-
-          $manifest = @{
-            name = "privacy-defaults"
-            publisher = "privacy-build"
-            displayName = "Privacy Defaults"
-            description = "Default settings for the privacy-hardened Code - OSS build."
-            version = "1.0.0"
-            engines = @{ vscode = "^1.50.0" }
-            contributes = @{ configurationDefaults = $defaults }
-          }
-
-          $manifestPath = Join-Path $extensionDir "package.json"
-          $manifest | ConvertTo-Json -Depth 20 | Set-Content $manifestPath -Encoding utf8
-
-          # Fail early if the marketplace or defaults were not written as expected.
-          $checkProduct = Get-Content $productPath -Raw | ConvertFrom-Json
-          if ($checkProduct.extensionsGallery.serviceUrl -ne "https://open-vsx.org/vscode/gallery") {
-            throw "Open VSX configuration was not written correctly."
-          }
-          $checkManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-          if ($checkManifest.contributes.configurationDefaults.'telemetry.telemetryLevel' -ne "off") {
-            throw "Privacy defaults extension manifest was not written correctly."
-          }
-
-      - name: Install npm dependencies (Linux)
+      # ---- Linux packaging: tar.gz (portable), .deb, .rpm ------------------
+      - name: Package (Linux) - tar.gz, deb, rpm
         if: runner.os == 'Linux'
         working-directory: vscode
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          # Electron 43's V8 headers need GCC 13 or newer. On Ubuntu 24.04,
-          # explicitly select GCC 13 for native-keymap and other native modules.
-          CC: gcc-13
-          CXX: g++-13
         run: |
           set -euo pipefail
-          node --version
-          npm --version
-          "$CC" --version
-          "$CXX" --version
-          npm install
+          mkdir -p "$GITHUB_WORKSPACE/dist"
 
-      - name: Install npm dependencies (Windows)
+          # Portable archive
+          tar --owner=0 --group=0 -czf "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-linux-x64.tar.gz" \
+            -C "$GITHUB_WORKSPACE" "$OUT_DIR"
+
+          # Debian / Ubuntu installer
+          npm run gulp "vscode-linux-${VSCODE_ARCH}-prepare-deb"
+          npm run gulp "vscode-linux-${VSCODE_ARCH}-build-deb"
+
+          # Fedora / RHEL / openSUSE installer
+          npm run gulp "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
+          npm run gulp "vscode-linux-${VSCODE_ARCH}-build-rpm"
+
+          pick() {
+            local f
+            f="$(find "$1" -type f -name "$2" | head -n1)"
+            [[ -n "$f" ]] || { echo "::error::No $2 found under $1"; exit 1; }
+            echo "$f"
+          }
+          cp "$(pick .build/linux/deb '*.deb')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-linux-x64.deb"
+          cp "$(pick .build/linux/rpm '*.rpm')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-linux-x64.rpm"
+          ls -lh "$GITHUB_WORKSPACE/dist"
+
+      # ---- Windows packaging: zip (portable), system + user installers -----
+      - name: Package (Windows) - zip, system setup, user setup
         if: runner.os == 'Windows'
         working-directory: vscode
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          node --version
-          npm --version
-          npm install
-          if ($LASTEXITCODE -ne 0) {
-            throw "npm install failed."
-          }
-
-      # The root npm install does not install this extension's own dependency tree.
-      # Packaging calls prepareBuiltInCopilotRipgrepShim, which requires
-      # extensions/copilot/node_modules/@github/copilot/sdk to exist in the app.
-      - name: Install built-in Copilot extension dependencies
-        working-directory: vscode/extensions/copilot
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: npm install
-
-      - name: Verify Copilot SDK dependency
-        working-directory: vscode/extensions/copilot
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $sdkPath = Join-Path $PWD "node_modules/@github/copilot/sdk"
-          if (-not (Test-Path $sdkPath -PathType Container)) {
-            throw "Copilot SDK is still missing after npm install: $sdkPath"
-          }
-          Write-Host "Copilot SDK dependency found at $sdkPath"
-
-      - name: Preserve Copilot SDK metadata and files during dependency packaging
-        working-directory: vscode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $ignorePath = Join-Path $PWD "build/.moduleignore"
-          $sdkPath = Join-Path $PWD "extensions/copilot/node_modules/@github/copilot/sdk"
-          $copilotPackageJson = Join-Path $PWD "extensions/copilot/node_modules/@github/copilot/package.json"
-
-          if (-not (Test-Path $sdkPath -PathType Container)) {
-            throw "Source Copilot SDK is missing: $sdkPath"
-          }
-          if (-not (Test-Path $copilotPackageJson -PathType Leaf)) {
-            throw "Source Copilot package.json is missing: $copilotPackageJson"
-          }
-          $copilotPackage = Get-Content $copilotPackageJson -Raw | ConvertFrom-Json
-          if (-not $copilotPackage.version) {
-            throw "Source @github/copilot/package.json does not contain a version."
-          }
-          if (-not (Test-Path $ignorePath -PathType Leaf)) {
-            throw "Dependency exclusion file was not found: $ignorePath"
-          }
-
-          # The upstream @github/copilot/** rule removes the SDK and its parent
-          # package.json. The packaging shim needs BOTH: sdk/ for its files and
-          # package.json to read the exact @github/copilot version when selecting
-          # the matching native platform package.
-          $lines = [System.Collections.Generic.List[string]]::new()
-          foreach ($line in (Get-Content $ignorePath)) { $lines.Add($line) }
-
-          $excludeIndex = -1
-          for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i].Trim() -match '^@github/copilot/\*\*/?$') {
-              $excludeIndex = $i
-              break
-            }
-          }
-          if ($excludeIndex -lt 0) {
-            throw "Expected upstream @github/copilot/** exclusion was not found in build/.moduleignore."
-          }
-
-          $includeRules = @(
-            "!@github/copilot/package.json",
-            "!@github/copilot/sdk/**"
-          )
-          $inserted = 0
-          foreach ($rule in $includeRules) {
-            # A negation must appear AFTER the broad exclusion to take effect.
-            $presentAfterExclude = $false
-            for ($j = $excludeIndex + 1; $j -lt $lines.Count; $j++) {
-              if ($lines[$j].Trim() -eq $rule) {
-                $presentAfterExclude = $true
-                break
-              }
-            }
-            if (-not $presentAfterExclude) {
-              $lines.Insert($excludeIndex + 1 + $inserted, $rule)
-              $inserted++
-            }
-          }
-
-          [System.IO.File]::WriteAllLines($ignorePath, $lines, [System.Text.UTF8Encoding]::new($false))
-          Write-Host "Preserved Copilot packaging rules:"
-          Write-Host "  !@github/copilot/package.json"
-          Write-Host "  !@github/copilot/sdk/**"
-
-      - name: Build Linux archive, Debian package, and RPM package
-        if: matrix.platform == 'linux-x64'
-        working-directory: vscode
-        shell: bash
-        env:
-          CC: gcc-13
-          CXX: g++-13
         run: |
           set -euo pipefail
-          export NODE_ENV=production
+          mkdir -p "$GITHUB_WORKSPACE/dist"
 
-          npm run gulp vscode-linux-x64-min
+          # Installer prerequisites + Inno Setup installers
+          npm run gulp "vscode-win32-${VSCODE_ARCH}-inno-updater"
+          npm run gulp "vscode-win32-${VSCODE_ARCH}-system-setup"
+          npm run gulp "vscode-win32-${VSCODE_ARCH}-user-setup"
 
-          # Current upstream defines prepare and build as separate Gulp tasks.
-          # The prepare tasks create the staging directories required by the build tasks.
-          npm run gulp vscode-linux-x64-prepare-deb
-          npm run gulp vscode-linux-x64-build-deb
-
-          npm run gulp vscode-linux-x64-prepare-rpm
-          npm run gulp vscode-linux-x64-build-rpm
-
-          # The packaged application directory is one level above the source checkout.
-          tar -czf ../code-oss-linux-x64.tar.gz -C .. VSCode-linux-x64
-
-          DEB=$(find .build/linux/deb -type f -name '*.deb' -print -quit || true)
-          RPM=$(find .build/linux/rpm -type f -name '*.rpm' -print -quit || true)
-          test -n "$DEB" && test -s "$DEB" || {
-            echo "No Debian package was generated under vscode/.build/linux/deb" >&2
-            exit 1
+          pick() {
+            local f
+            f="$(find "$1" -type f -name "$2" | head -n1)"
+            [[ -n "$f" ]] || { echo "::error::No $2 found under $1"; exit 1; }
+            echo "$f"
           }
-          test -n "$RPM" && test -s "$RPM" || {
-            echo "No RPM package was generated under vscode/.build/linux/rpm" >&2
-            exit 1
-          }
+          cp "$(pick .build/win32-x64/system-setup '*.exe')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64-system-setup.exe"
+          cp "$(pick .build/win32-x64/user-setup '*.exe')"   "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64-user-setup.exe"
 
-          cp "$DEB" ../code-oss-linux-x64.deb
-          cp "$RPM" ../code-oss-linux-x64.rpm
-          ls -lh ../code-oss-linux-x64.tar.gz ../code-oss-linux-x64.deb ../code-oss-linux-x64.rpm
+          # Portable zip (create a "data" folder next to "Code - OSS.exe" to enable portable mode)
+          cd "$GITHUB_WORKSPACE/$OUT_DIR"
+          7z a -tzip -mx=5 -bd "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64.zip" ./*
+          ls -lh "$GITHUB_WORKSPACE/dist"
 
-      - name: Build Windows portable archive and installer
-        if: matrix.platform == 'windows-x64'
-        working-directory: vscode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $env:NODE_ENV = "production"
-
-          npm run gulp vscode-win32-x64-min
-          if ($LASTEXITCODE -ne 0) { throw "Windows application build failed." }
-
-          npm run gulp vscode-win32-x64-inno-updater
-          if ($LASTEXITCODE -ne 0) { throw "Windows Inno Setup updater preparation failed." }
-
-          npm run gulp vscode-win32-x64-user-setup
-          if ($LASTEXITCODE -ne 0) { throw "Windows user installer build failed." }
-
-          $workspace = $env:GITHUB_WORKSPACE
-          $packageDir = Join-Path $workspace "VSCode-win32-x64"
-          if (-not (Test-Path $packageDir -PathType Container)) {
-            throw "Windows application output was not found at $packageDir"
-          }
-
-          $zipPath = Join-Path $workspace "code-oss-windows-x64.zip"
-          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal
-
-          $setupDir = Join-Path $PWD ".build\win32-x64\user-setup"
-          if (-not (Test-Path $setupDir -PathType Container)) {
-            throw "Windows installer output directory was not found at $setupDir"
-          }
-          $installers = @(Get-ChildItem $setupDir -Filter "*.exe" -File)
-          if ($installers.Count -eq 0) {
-            throw "No Windows installer executable was generated in $setupDir"
-          }
-
-          $installerPath = Join-Path $workspace "code-oss-windows-x64-setup.exe"
-          Copy-Item $installers[0].FullName $installerPath -Force
-          Get-Item $zipPath, $installerPath | Select-Object Name, Length
-
-      - name: Upload Linux packages
-        if: matrix.platform == 'linux-x64'
-        uses: actions/upload-artifact@v7
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
-          path: |
-            code-oss-linux-x64.tar.gz
-            code-oss-linux-x64.deb
-            code-oss-linux-x64.rpm
+          name: dist-${{ matrix.name }}
+          path: dist/*
           if-no-files-found: error
-          retention-days: 30
+          compression-level: 0
+          retention-days: 7
 
-      - name: Upload Windows installer and portable archive
-        if: matrix.platform == 'windows-x64'
-        uses: actions/upload-artifact@v7
-        with:
-          name: code-oss-${{ matrix.platform }}-${{ needs.check.outputs.tag }}
-          path: |
-            code-oss-windows-x64.zip
-            code-oss-windows-x64-setup.exe
-          if-no-files-found: error
-          retention-days: 30
-
+  # ---------------------------------------------------------------------------
+  # 3. Create the release (only when every build job succeeded)
+  # ---------------------------------------------------------------------------
   release:
-    needs: [check, build]
-    if: needs.check.outputs.changed == 'true'
+    name: Publish release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Download all build assets
-        uses: actions/download-artifact@v7
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
         with:
-          pattern: code-oss-*-${{ needs.check.outputs.tag }}
-          path: release-assets
+          pattern: dist-*
+          path: dist
           merge-multiple: true
 
-      - name: Create or refresh GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
-        shell: bash
+      - name: Generate checksums
+        working-directory: dist
         run: |
-          set -euo pipefail
-          shopt -s nullglob
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
-          assets=(release-assets/*)
-          if [ ${#assets[@]} -eq 0 ]; then
-            echo "No build assets were downloaded." >&2
-            exit 1
-          fi
-
-          title="Code - OSS ${UPSTREAM_TAG} (Open VSX, privacy defaults)"
-          notes=$(cat <<EOF
-          Privacy-hardened Code - OSS build from upstream Microsoft VS Code tag ${UPSTREAM_TAG}.
-
-          Included assets:
-          - Windows x64 setup installer and portable ZIP
-          - Debian/Ubuntu x64 .deb package
-          - Fedora/RHEL-compatible x64 .rpm package
-          - Generic Linux x64 .tar.gz archive
-
-          Extensions are served by Open VSX. Telemetry is disabled in the product configuration; update and AI-related settings have privacy-focused defaults.
-          EOF
-          )
-
-          if gh release view "$UPSTREAM_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$UPSTREAM_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$title" \
-              --notes "$notes"
-          else
-            gh release create "$UPSTREAM_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "$title" \
-              --notes "$notes"
-          fi
-
-          gh release upload "$UPSTREAM_TAG" "${assets[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
-
-  record:
-    needs: [check, release]
-    if: needs.check.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v7
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          ref: ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Code - OSS ${{ needs.prepare.outputs.tag }}
+          draft: false
+          prerelease: false
+          make_latest: "true"
+          fail_on_unmatched_files: true
+          files: dist/*
+          body: |
+            Unofficial build of upstream [`microsoft/vscode` ${{ needs.prepare.outputs.tag }}](https://github.com/microsoft/vscode/tree/${{ needs.prepare.outputs.tag }}) (commit `${{ needs.prepare.outputs.commit }}`).
 
-      - name: Record successfully published upstream release
-        env:
-          UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
+            **Build-time changes**
+            - Extension marketplace: [Open VSX](https://open-vsx.org)
+            - Defaults: `extensions.autoCheckUpdates=false`, `extensions.autoUpdate=false`, `update.mode=none`,
+              `update.showReleaseNotes=false`, `telemetry.telemetryLevel=off`, `chat.disableAIFeatures=true`
+              (users can still change these in their own settings)
 
-          echo "$UPSTREAM_TAG" > .upstream-vscode-release
+            **Downloads**
+            | Platform | Installer | Portable |
+            |---|---|---|
+            | Windows x64 | `*-win32-x64-system-setup.exe`, `*-win32-x64-user-setup.exe` | `*-win32-x64.zip` (add a `data` folder next to `Code - OSS.exe` for portable mode) |
+            | Debian / Ubuntu | `*-linux-x64.deb` | `*-linux-x64.tar.gz` |
+            | Fedora / RHEL / openSUSE | `*-linux-x64.rpm` | `*-linux-x64.tar.gz` |
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add .upstream-vscode-release
-
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: record upstream VS Code release $UPSTREAM_TAG"
-            git push
-          fi
+            Binaries are unsigned. Verify downloads with `SHA256SUMS.txt`.
