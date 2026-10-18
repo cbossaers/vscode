@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       changed: ${{ steps.release.outputs.changed }}
       tag: ${{ steps.release.outputs.tag }}
@@ -213,6 +213,15 @@ jobs:
           }
 
           $product = Get-Content $file -Raw | ConvertFrom-Json
+
+          # Keep the bundled GitHub Copilot Chat extension from the source tree,
+          # but prevent VS Code's separate product-level mechanism from fetching
+          # an auto-updated copy from an extension gallery.
+          $product | Add-Member `
+            -NotePropertyName builtInExtensionsEnabledWithAutoUpdates `
+            -NotePropertyValue @() `
+            -Force
+
           if (-not $product.extensionsGallery) {
             $product | Add-Member `
               -NotePropertyName extensionsGallery `
@@ -296,12 +305,12 @@ jobs:
 
           Replace-ExactlyOnce `
             "src/vs/platform/telemetry/common/telemetryService.ts" `
-            "\[TELEMETRY_SETTING_ID\]\s*:\s*\{.*?('default'\s*:\s*)TelemetryConfiguration\.ON" `
+            "(\[TELEMETRY_SETTING_ID\]\s*:\s*\{.*?'default'\s*:\s*)TelemetryConfiguration\.ON" `
             '$1TelemetryConfiguration.OFF'
 
           Replace-ExactlyOnce `
             "src/vs/platform/telemetry/common/telemetryService.ts" `
-            "\[TELEMETRY_OLD_SETTING_ID\]\s*:\s*\{.*?('default'\s*:\s*)true" `
+            "(\[TELEMETRY_OLD_SETTING_ID\]\s*:\s*\{.*?'default'\s*:\s*)true" `
             '$1false'
 
       - name: Build application
@@ -384,26 +393,25 @@ jobs:
           "path=$package" >> $env:GITHUB_OUTPUT
           Write-Host "Resolved package directory: $package"
 
-      - name: Remove built-in Copilot extension
+      - name: Verify bundled Chat extension is retained
         shell: pwsh
         env:
           PACKAGE_DIR: ${{ steps.package.outputs.path }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $package = $env:PACKAGE_DIR
-          $extensions = Join-Path $package "resources/app/extensions"
-          $copilot = Join-Path $extensions "copilot"
-
-          if (Test-Path $copilot) {
-            Remove-Item $copilot -Recurse -Force
+          $manifestPath = Join-Path $env:PACKAGE_DIR "resources/app/extensions/copilot/package.json"
+          if (-not (Test-Path $manifestPath -PathType Leaf)) {
+            throw "Bundled Chat extension manifest was not found at '$manifestPath'. The build may no longer include the upstream Chat extension."
           }
 
-          if (Test-Path $copilot) {
-            throw "Copilot extension still exists in package."
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.publisher -ne "GitHub" -or $manifest.name -ne "copilot-chat") {
+            throw "Unexpected extension manifest at '$manifestPath' (publisher='$($manifest.publisher)', name='$($manifest.name)')."
           }
 
-          Write-Host "Copilot extension excluded."
+          Write-Host "Retaining bundled extension $($manifest.publisher).$($manifest.name), version $($manifest.version)."
+          Write-Host "Product-level built-in extension auto-updates are disabled; BYOK/chat functionality remains bundled."
 
       - name: Archive Linux build
         if: runner.os == 'Linux'
