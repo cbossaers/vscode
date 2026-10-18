@@ -640,17 +640,21 @@ jobs:
           }
           Write-Host "Created standard archive: $env:ARCHIVE"
 
-      - name: Remove core AI, Chat, and agent functionality from no-AI source
+      - name: Remove user-facing AI feature entry points from no-AI source
         working-directory: vscode
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # The standard build has already been archived. Recompile the same
-          # source after removing every built-in AI/Chat entry-point import.
-          # VS Code loads core contributions from these explicit main files;
-          # this prevents the contributions from being included in the no-AI
-          # edition's runtime bundles rather than merely hiding their UI.
+          # Do not remove shared chat/agent service registrations from the
+          # core workbench entry points. Those singleton registrations can be
+          # consumed during startup by code outside the visible Chat UI; pruning
+          # them too aggressively can compile successfully but leave a blank
+          # renderer window at runtime.
+          #
+          # Instead, remove the user-facing feature contribution roots. The
+          # Copilot extension and the dedicated Agents/Sessions bundle are
+          # removed from the shipped no-AI package in later steps.
           $targets = @{
             "src/vs/workbench/workbench.common.main.ts" = @(
               "/contrib/chat/",
@@ -660,35 +664,12 @@ jobs:
               "/contrib/remoteCodingAgents/",
               "/contrib/mcp/",
               "/contrib/speech/",
-              "/contrib/imageCarousel/",
-              "/services/mcp/",
-              "/platform/mcp/",
-              "/services/chat/",
-              "/services/agentHost/",
-              "/platform/agentHost/",
-              "/platform/copilotConnectors/",
-              "/services/aiEmbeddingVector/",
-              "/services/aiRelatedInformation/",
-              "/services/aiSettingsSearch/",
-              "/authenticationMcp",
-              "/common/agentsColors.js",
-              "/common/agentsSizes.js"
+              "/contrib/imageCarousel/"
             )
             "src/vs/workbench/workbench.desktop.main.ts" = @(
               "/contrib/chat/",
-              "/contrib/inlineChat/",
               "/contrib/agentsVoice/",
-              "/contrib/welcomeAgentSessions/",
-              "/contrib/remoteCodingAgents/",
-              "/contrib/mcp/",
-              "/contrib/speech/",
-              "/services/mcp/",
-              "/platform/mcp/",
-              "/services/localTranscription/",
-              "/services/chat/",
-              "/services/agentHost/",
-              "/platform/agentHost/",
-              "/platform/copilotConnectors/"
+              "/contrib/mcp/"
             )
             "src/vs/workbench/workbench.web.main.ts" = @(
               "/contrib/chat/",
@@ -698,117 +679,25 @@ jobs:
               "/contrib/remoteCodingAgents/",
               "/contrib/mcp/",
               "/contrib/speech/",
-              "/contrib/imageCarousel/",
-              "/services/mcp/",
-              "/platform/mcp/",
-              "/services/chat/",
-              "/services/agentHost/",
-              "/platform/agentHost/",
-              "/platform/copilotConnectors/",
-              "/services/aiEmbeddingVector/",
-              "/services/aiRelatedInformation/",
-              "/services/aiSettingsSearch/",
-              "/authenticationMcp",
-              "/common/agentsColors.js",
-              "/common/agentsSizes.js"
+              "/contrib/imageCarousel/"
             )
-            "src/vs/sessions/sessions.common.main.ts" = @(
-              "/contrib/chat/",
-              "/contrib/inlineChat/",
-              "/contrib/agentsVoice/",
-              "/contrib/welcomeAgentSessions/",
-              "/contrib/remoteCodingAgents/",
-              "/contrib/mcp/",
-              "/contrib/speech/",
-              "/contrib/imageCarousel/",
-              "/contrib/aiCustomizationTreeView/",
-              "/contrib/copilotChatSessions/",
-              "/contrib/agentHostFilter/",
-              "/contrib/providers/agentHost/",
-              "/contrib/providers/remoteAgentHost/",
-              "/contrib/sessionComparison/",
-              "/contrib/chatDebug/",
-              "/contrib/codeReview/",
-              "/contrib/remoteSessions/",
-              "/contrib/applyCommitsToParentRepo/",
-              "/contrib/changes/",
-              "/contrib/automations/",
-              "/contrib/tunnelHost/",
-              "/contrib/agentFeedback/",
-              "/contrib/sessions/",
-              "/contrib/github/",
-              "/contrib/agentHost/",
-              "/services/mcp/",
-              "/platform/mcp/",
-              "/services/chat/",
-              "/services/agentHost/",
-              "/platform/agentHost/",
-              "/platform/copilotConnectors/",
-              "/services/aiEmbeddingVector/",
-              "/services/aiRelatedInformation/",
-              "/services/aiSettingsSearch/",
-              "/services/agentHostFilter/",
-              "/services/localTranscription/",
-              "/authenticationMcp"
-            )
-            "src/vs/sessions/sessions.desktop.main.ts" = @(
-              "/contrib/openAgentsWindow/",
-              "/contrib/chat/",
-              "/contrib/inlineChat/",
-              "/contrib/agentsVoice/",
-              "/contrib/mcp/",
-              "/contrib/agentFeedback/",
-              "/contrib/providers/agentHost/",
-              "/contrib/providers/remoteAgentHost/",
-              "/contrib/remoteCodingAgents/",
-              "/contrib/welcomeAgentSessions/",
-              "/platform/copilotConnectors/",
-              "/platform/mcp/",
-              "/platform/agentHost/",
-              "/workbench/contrib/chat/",
-              "/workbench/contrib/mcp/",
-              "/workbench/contrib/agentsVoice/",
-              "/workbench/services/mcp/",
-              "/workbench/services/agentHost/",
-              "/workbench/services/localTranscription/"
-            )
-            "src/vs/sessions/sessions.web.main.ts" = @(
-              "/contrib/chat/",
-              "/contrib/inlineChat/",
-              "/contrib/agentsVoice/",
-              "/contrib/mcp/",
-              "/contrib/agentFeedback/",
-              "/contrib/providers/agentHost/",
-              "/contrib/providers/remoteAgentHost/",
-              "/contrib/remoteCodingAgents/",
-              "/contrib/welcomeAgentSessions/",
-              "/platform/mcp/",
-              "/platform/agentHost/",
-              "/workbench/contrib/chat/",
-              "/workbench/contrib/mcp/",
-              "/workbench/contrib/agentsVoice/",
-              "/workbench/services/mcp/",
-              "/workbench/services/agentHost/",
-              "/workbench/services/localTranscription/"
-            )
-            # This small core editor contribution directly wires up an AI-based
-            # empty-editor chat hint and speech dictation. Drop only those roots
-            # in this edition; editor fundamentals remain enabled.
             "src/vs/workbench/contrib/codeEditor/browser/codeEditor.contribution.ts" = @(
               "/emptyTextEditorHint/emptyTextEditorHint.js",
               "/dictation/editorDictation.js"
             )
           }
 
-          # Remove a complete static import statement, including multiline named
-          # imports. Matching only the first line can leave broken TypeScript or
-          # silently retain an AI dependency when upstream reformats an import.
-          $registrationPattern = '(?im)^[ \t]*registerSingleton\([^;\r\n]*(?:Mcp|AgentHost|Copilot|Chat|AgentsVoice|AiEmbedding|AiRelated|AiSettings|RemoteCodingAgent|AgentFeedback|PluginGit|Transcription|SessionComparison|SessionGroup|SessionSection|SessionList|SessionManagement|CloudSandbox)[^;\r\n]*;[ \t]*(?:\r?\n)?'
-          $removedTotal = 0
+          $minimums = @{
+            "src/vs/workbench/workbench.common.main.ts" = 3
+            "src/vs/workbench/workbench.desktop.main.ts" = 1
+            "src/vs/workbench/workbench.web.main.ts" = 1
+            "src/vs/workbench/contrib/codeEditor/browser/codeEditor.contribution.ts" = 1
+          }
 
+          $removedTotal = 0
           foreach ($relativePath in $targets.Keys) {
             if (-not (Test-Path $relativePath -PathType Leaf)) {
-              throw "Expected entry point not found: $relativePath. Upstream layout changed; refusing to produce a misleading no-AI build."
+              throw "Expected entry point not found: $relativePath. Upstream layout changed."
             }
 
             $fullPath = (Resolve-Path $relativePath).Path
@@ -825,72 +714,45 @@ jobs:
               }
             }
 
-            $beforeRegistrations = [regex]::Matches($source, $registrationPattern).Count
-            $source = [regex]::Replace($source, $registrationPattern, '')
-            $removedRegistrations = $beforeRegistrations
-
-            # The open-agents command is a direct call rather than a contribution
-            # registration. Its import was removed above; remove the invocation too.
-            $openAgentsPattern = '(?m)^[ \t]*registerOpenAgentsWindowCommand\(\);[ \t]*(?:\r?\n)?'
-            $removedOpenAgentsCall = [regex]::Matches($source, $openAgentsPattern).Count
-            $source = [regex]::Replace($source, $openAgentsPattern, '')
-
-            $minimum = switch ($relativePath) {
-              "src/vs/workbench/workbench.common.main.ts" { 15 }
-              "src/vs/workbench/workbench.desktop.main.ts" { 8 }
-              "src/vs/workbench/workbench.web.main.ts" { 6 }
-              "src/vs/sessions/sessions.common.main.ts" { 30 }
-              "src/vs/sessions/sessions.desktop.main.ts" { 18 }
-              "src/vs/sessions/sessions.web.main.ts" { 15 }
-              "src/vs/workbench/contrib/codeEditor/browser/codeEditor.contribution.ts" { 2 }
-              default { throw "No patch minimum configured for $relativePath" }
-            }
-            $removedFromFile = $removedImports + $removedRegistrations + $removedOpenAgentsCall
-            if ($removedFromFile -lt $minimum) {
-              throw "Only removed $removedFromFile AI-related imports/registrations from $relativePath; expected at least $minimum. Upstream may have changed; refusing to label this build AI-free."
+            if ($removedImports -lt $minimums[$relativePath]) {
+              throw "Removed only $removedImports feature imports from $relativePath; expected at least $($minimums[$relativePath]). Upstream may have changed."
             }
 
-            # Guard against an upstream edit that moved an AI import to a different
-            # line format. The regex catches multiline imports, not just one-line ones.
             foreach ($fragment in $targets[$relativePath]) {
               $escapedFragment = [regex]::Escape($fragment)
               $remainingImportPattern = '(?m)^[ \t]*import\b[^;]*' + $escapedFragment + '[^;]*;'
               if ([regex]::IsMatch($source, $remainingImportPattern)) {
-                throw "AI-related import remains in $relativePath matching '$fragment'."
+                throw "AI feature import remains in $relativePath matching '$fragment'."
               }
             }
 
             [System.IO.File]::WriteAllText($fullPath, $source, [System.Text.UTF8Encoding]::new($false))
-            $removedTotal += $removedFromFile
-            Write-Host "$relativePath`: removed $removedImports AI imports, $removedRegistrations AI service registrations, and $removedOpenAgentsCall agent-window calls."
+            $removedTotal += $removedImports
+            Write-Host "$relativePath`: removed $removedImports user-facing AI feature imports; retained shared service registrations."
           }
 
-          if ($removedTotal -lt 100) {
-            throw "Only $removedTotal AI-related entry-point imports/registrations were removed; expected at least 100. Upstream may have changed; refusing to label this build AI-free."
+          if ($removedTotal -lt 6) {
+            throw "Only $removedTotal AI feature imports were removed; expected at least 6. Upstream may have changed."
           }
 
-          # The extension-host API bridge separately publishes vscode.editorChat.start
-          # as the inlineChat.start command. This is an API registration, not the
-          # inline-chat workbench implementation; remove the registration itself
-          # instead of treating its string in extensionHostProcess.js as a false
-          # positive or leaving the API callable in the no-AI edition.
+          # Remove the extension-host inline-chat command API as well. The API
+          # registration is independent of the main workbench UI contribution.
           $apiPath = "src/vs/workbench/api/common/extHostApiCommands.ts"
           if (-not (Test-Path $apiPath -PathType Leaf)) {
             throw "Expected extension-host API source not found: $apiPath"
           }
           $apiSource = [System.IO.File]::ReadAllText($apiPath) -replace "`r`n", "`n"
-
           $inlineApiPattern = '(?s)// --- inline chat\s+new ApiCommand\(\s*''vscode\.editorChat\.start''\s*,\s*''inlineChat\.start''.*?ApiCommandResult\.Void\s*\)\s*,\s*(?=// --- extension prompt files)'
           $inlineApiMatches = [regex]::Matches($apiSource, $inlineApiPattern).Count
           if ($inlineApiMatches -ne 1) {
-            throw "Expected exactly one extension-host inline-chat API registration in $apiPath; found $inlineApiMatches. Upstream changed; refusing to produce a misleading no-AI build."
+            throw "Expected exactly one extension-host inline-chat API registration in $apiPath; found $inlineApiMatches. Upstream changed."
           }
           $apiSource = ([regex]::new($inlineApiPattern)).Replace($apiSource, '', 1)
 
           $inlineTypesPattern = '(?s)type InlineChatEditorApiArg\s*=\s*\{.*?\};\s*type InlineChatRunOptions\s*=\s*\{.*?\};'
           $inlineTypesMatches = [regex]::Matches($apiSource, $inlineTypesPattern).Count
           if ($inlineTypesMatches -ne 1) {
-            throw "Expected exactly one inline-chat API type block in $apiPath; found $inlineTypesMatches. Upstream changed; refusing to produce a misleading no-AI build."
+            throw "Expected exactly one inline-chat API type block in $apiPath; found $inlineTypesMatches. Upstream changed."
           }
           $apiSource = ([regex]::new($inlineTypesPattern)).Replace($apiSource, '', 1)
 
@@ -898,10 +760,7 @@ jobs:
             throw "Inline-chat extension-host API identifiers remain in $apiPath after patching."
           }
           [System.IO.File]::WriteAllText($apiPath, $apiSource, [System.Text.UTF8Encoding]::new($false))
-          Write-Host "Removed the inline-chat extension-host API registration and its types from the no-AI source."
-
-          Write-Host "Removed built-in Chat, inline Chat, model catalogue, MCP, voice, Copilot connector, remote/local agent host and dedicated Agent Sessions entry-point roots before recompilation."
-
+          Write-Host "Removed the inline-chat extension-host API while preserving the shared workbench service registrations required for startup."
       - name: Strip Copilot-specific product configuration for no-AI build
         working-directory: vscode
         shell: pwsh
@@ -911,7 +770,6 @@ jobs:
           $product = Get-Content $file -Raw | ConvertFrom-Json
 
           $propertiesToRemove = @(
-            "defaultChatAgent",
             "copilotVersions",
             "agentSdks",
             "mcpGallery",
@@ -1286,7 +1144,7 @@ jobs:
           $productPath = Join-Path $env:PACKAGE_DIR "resources/app/product.json"
           $product = Get-Content $productPath -Raw | ConvertFrom-Json
           $forbiddenProperties = @(
-            "defaultChatAgent", "copilotVersions", "agentSdks", "mcpGallery",
+            "copilotVersions", "agentSdks", "mcpGallery",
             "aiConfig", "chatParticipantRegistry", "chatSessionRecommendations",
             "agentsTelemetryAppName", "trustedMcpAuthAccess", "aiGeneratedWorkspaceTrust", "voiceWsUrl",
             "settingsSearchUrl", "settingsSearchBuildId", "dictationRuntime", "sessionsWindowAllowedExtensions"
@@ -1456,7 +1314,7 @@ jobs:
 
             The standard edition bundles the BYOK known-model catalogue locally, so it does not fetch `copilotChat.json` from Microsoft's CDN at startup.
 
-            The no-AI edition is separately recompiled after removing core Chat, inline Chat, image-carousel, agent-session, remote-coding-agent, voice/dictation, MCP, agent-host, AI metadata-service and Copilot-connector entry-point imports. Its AI-based empty-editor hint is also removed. These import roots are pruned before compilation, so their implementation modules are not pulled into the main workbench bundles; the separate compiled Agents/Sessions bundle, bundled Copilot extension and Copilot SDK package (if packaged separately) are also removed from the no-AI package. Copilot/AI product metadata is stripped and the edition has its own application identity and data directory. This removes built-in AI functionality from the shipped application; users can still manually install third-party AI extensions from Open VSX unless you choose to block those extensions separately.
+            The no-AI edition is separately recompiled after removing the user-facing Chat, inline-Chat, Agents/Voice, MCP, remote-coding-agent and related contribution entry points, plus the AI-based empty-editor hint and inline-chat extension-host API. Shared service registrations are preserved to keep the workbench startup dependency graph intact. The packaged Copilot Chat extension, Copilot SDK package (if packaged separately), and dedicated Agents/Sessions bundle are removed. Nonessential Copilot/AI metadata is stripped while retaining the upstream-required defaultChatAgent compatibility object; the edition has its own application identity and data directory. Users can still install third-party AI extensions from Open VSX unless you choose to block those extensions separately.
 
             `SHA256SUMS` contains SHA-256 checksums for all four archives.
           files: |
@@ -1477,7 +1335,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Record successfully built release
         env:
