@@ -71,7 +71,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04
+          # Use the same Ubuntu generation used by upstream VS Code CI.
+          # Ubuntu 26.04 currently hits a dpkg-shlibdeps / Dpkg::Shlibs::SymbolFile
+          # Perl compatibility failure during prepare-deb.
+          - os: ubuntu-22.04
             platform: linux-x64
           - os: windows-2022
             platform: windows-x64
@@ -104,6 +107,37 @@ jobs:
       - name: Set up Windows build tools
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v2
+
+      # VS Code's Windows packaging invokes signtool.exe by name. The SDK may be
+      # installed on the runner without its directory being on PATH.
+      - name: Locate Windows SDK SignTool
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $tool = $null
+
+          if (Test-Path $kits) {
+            $tools = @(Get-ChildItem $kits -Filter signtool.exe -Recurse -File -ErrorAction SilentlyContinue)
+            $tool = $tools |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+
+            if (-not $tool) {
+              $tool = $tools |
+                Where-Object { $_.FullName -match '\\App Certification Kit\\signtool\.exe$' } |
+                Select-Object -First 1
+            }
+          }
+
+          if (-not $tool) {
+            throw "signtool.exe was not found under '$kits'. Ensure the Windows SDK Signing Tools are installed."
+          }
+
+          $tool.DirectoryName | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "Using SignTool: $($tool.FullName)"
 
       # Code - OSS does not expose a supported product.json field for arbitrary
       # configuration defaults. A tiny built-in extension contributes the defaults
