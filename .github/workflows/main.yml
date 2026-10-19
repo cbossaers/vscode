@@ -222,6 +222,27 @@ jobs:
           grep -n 'copilot' build/.moduleignore
 
       # ---- Install dependencies ---------------------------------------------
+      # setup-env.sh runs build/*.ts helpers, which import packages from build/node_modules.
+      # Upstream installs the build workspace dependencies before sourcing setup-env.sh.
+      - name: Install build-script dependencies (Linux)
+        if: runner.os == 'Linux'
+        working-directory: vscode/build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ok=0
+          for attempt in 1 2; do
+            if npm ci; then
+              ok=1
+              break
+            fi
+            echo "::warning::build npm ci failed (attempt ${attempt}/2), cleaning up and retrying..."
+            rm -rf node_modules
+            sleep 20
+          done
+          [[ "$ok" == "1" ]]
+
       # Use the same compiler/sysroot/libc++ setup as Microsoft's Linux pipeline.
       # Do not force GCC 13: setup-env.sh configures Chromium's matching Clang and sysroot.
       - name: npm ci (Linux, upstream toolchain)
@@ -231,6 +252,7 @@ jobs:
           VSCODE_ARCH: x64
           npm_config_arch: x64
           ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
