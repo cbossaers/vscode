@@ -95,9 +95,11 @@ jobs:
           - name: linux-x64
             os: ubuntu-24.04 # GCC 13: the Electron 43 / V8 headers do not compile with GCC 11 (ubuntu-22.04)
             platform: linux
+            rust_target: x86_64-unknown-linux-gnu
           - name: win32-x64
             os: windows-2022
             platform: win32
+            rust_target: x86_64-pc-windows-msvc
     defaults:
       run:
         shell: bash
@@ -148,7 +150,7 @@ jobs:
           sudo apt-get install -y \
             build-essential g++ pkg-config python-is-python3 jq \
             libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev \
-            fakeroot rpm dpkg-dev xz-utils gcc-13 g++-13
+            fakeroot rpm dpkg-dev xz-utils gcc-13 g++-13 libssl-dev
           # Make node-gyp use a compiler new enough for the Electron/V8 headers
           echo "CC=gcc-13" >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
@@ -261,6 +263,41 @@ jobs:
             and .configurationDefaults["telemetry.telemetryLevel"] == "off"
             and .configurationDefaults["chat.disableAIFeatures"] == true
           ' "${OUT_DIR}/resources/app/product.json"
+
+      # ---- CLI / Remote Tunnels binary -------------------------------------
+      # The gulp *-min-ci task does not build the Rust CLI; upstream's pipeline builds it
+      # separately and drops it into bin/. Packaging (dpkg-shlibdeps for deb/rpm, the Inno
+      # installers on Windows) expects it to exist, so we build it here.
+      - name: Build CLI / tunnel binary (Linux)
+        if: runner.os == 'Linux'
+        working-directory: vscode/cli
+        env:
+          OPENSSL_STATIC: "1"
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.rust_target }}"
+          cargo build --release --target "${{ matrix.rust_target }}"
+          TUNNEL_NAME="$(jq -r .tunnelApplicationName ../product.json)"
+          echo "Tunnel binary name: $TUNNEL_NAME"
+          install -m 755 "target/${{ matrix.rust_target }}/release/code" \
+            "$GITHUB_WORKSPACE/${OUT_DIR}/bin/${TUNNEL_NAME}"
+          ls -l "$GITHUB_WORKSPACE/${OUT_DIR}/bin"
+
+      # NOTE: untested. If the Inno Setup step complains about the location of the file,
+      # or cargo fails on OpenSSL, see the notes in the chat (check cli/Cargo.toml and
+      # upstream's build/azure-pipelines/cli/ scripts).
+      - name: Build CLI / tunnel binary (Windows)
+        if: runner.os == 'Windows'
+        working-directory: vscode/cli
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.rust_target }}"
+          cargo build --release --target "${{ matrix.rust_target }}"
+          TUNNEL_NAME="$(jq -r .tunnelApplicationName ../product.json)"
+          echo "Tunnel binary name: $TUNNEL_NAME"
+          cp "target/${{ matrix.rust_target }}/release/code.exe" \
+            "$GITHUB_WORKSPACE/${OUT_DIR}/bin/${TUNNEL_NAME}.exe"
+          ls -l "$GITHUB_WORKSPACE/${OUT_DIR}/bin"
 
       # ---- Linux packaging: tar.gz (portable), .deb, .rpm ------------------
       - name: Package (Linux) - tar.gz, deb, rpm
