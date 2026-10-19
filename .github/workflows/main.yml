@@ -55,14 +55,14 @@ jobs:
           if [[ -n "${INPUT_TAG:-}" ]]; then
             TAG="${INPUT_TAG}"
           else
-            # Newest plain X.Y.Z tag (ignores insiders / pre-release style tags)
+            # Newest plain X.Y.Z tag (ignores insiders / pre-release style tags).
             TAG="$(git ls-remote --tags --refs "$URL" \
               | awk '{print $2}' | sed 's#refs/tags/##' \
               | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
           fi
           [[ -n "$TAG" ]] || { echo "::error::Could not determine upstream tag"; exit 1; }
 
-          # Make sure the tag really exists upstream and grab its commit
+          # Resolve annotated tags to their commit when applicable.
           COMMIT="$(git ls-remote --tags "$URL" "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -n1 | cut -f1)"
           [[ -n "$COMMIT" ]] || { echo "::error::Tag ${TAG} not found in ${UPSTREAM_REPO}"; exit 1; }
 
@@ -93,7 +93,7 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-24.04 # GCC 13: the Electron 43 / V8 headers do not compile with GCC 11 (ubuntu-22.04)
+            os: ubuntu-24.04
             platform: linux
             rust_target: x86_64-unknown-linux-gnu
           - name: win32-x64
@@ -105,6 +105,7 @@ jobs:
         shell: bash
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
+      UPSTREAM_COMMIT: ${{ needs.prepare.outputs.commit }}
       VSCODE_ARCH: x64
       OUT_DIR: VSCode-${{ matrix.platform }}-x64
       NODE_OPTIONS: --max-old-space-size=8192
@@ -136,7 +137,12 @@ jobs:
       - name: Install Python setuptools
         run: python -m pip install --upgrade pip setuptools
 
-      # ---- Linux prerequisites (from the CONTRIBUTING prerequisites) -------
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      # ---- Linux prerequisites (from upstream CONTRIBUTING/build pipeline) ----
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -150,13 +156,9 @@ jobs:
           sudo apt-get install -y \
             build-essential g++ pkg-config python-is-python3 jq \
             libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev \
-            fakeroot rpm dpkg-dev xz-utils gcc-13 g++-13 libssl-dev
-          # Make node-gyp use a compiler new enough for the Electron/V8 headers
-          echo "CC=gcc-13" >> "$GITHUB_ENV"
-          echo "CXX=g++-13" >> "$GITHUB_ENV"
-          gcc-13 --version | head -n1
+            fakeroot rpm dpkg-dev xz-utils libssl-dev curl
 
-      # ---- Windows prerequisites ------------------------------------------
+      # ---- Windows prerequisites --------------------------------------------
       - name: Install MSVC Spectre-mitigated libraries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -175,10 +177,14 @@ jobs:
             throw "Visual Studio installer failed with exit code $($p.ExitCode)"
           }
 
-      # ---- Customise product.json -----------------------------------------
-      # * extensionsGallery -> Open VSX (the FOSS VSIX marketplace)
-      # * configurationDefaults -> build-time default values for the settings
-      #   (users can still override them in their own settings.json)
+      - name: Set up MSVC developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ---- Customise product.json -------------------------------------------
+      # Open VSX gallery and user-overridable privacy/update defaults.
       - name: Patch product.json (Open VSX + default settings)
         working-directory: vscode
         run: |
@@ -206,42 +212,74 @@ jobs:
           echo "--- patched product.json (relevant keys) ---"
           jq '{extensionsGallery, configurationDefaults}' product.json
 
-      # Recent VS Code bundles Copilot Chat as a built-in extension and packaging requires
-      # node_modules/@github/copilot/{package.json,sdk/} inside it. Upstream's CI gets exactly
-      # that layout from a pre-built VSIX; a from-source build has it stripped by the blanket
-      # `@github/copilot/**` rule in build/.moduleignore (microsoft/vscode#337976, layout
-      # described in #310156). Re-include those two paths so a from-source build ships the
-      # same files. This is a config change only - no upstream code is modified.
+      # Recent VS Code bundles Copilot Chat as a built-in extension and packaging
+      # requires node_modules/@github/copilot/{package.json,sdk/} inside it.
+      # Preserve those paths when the extension's files are staged for packaging.
       - name: Keep Copilot package.json + sdk/ in the packaged extension
         working-directory: vscode
         run: |
           printf '\n!@github/copilot/package.json\n!@github/copilot/sdk/**\n' >> build/.moduleignore
           grep -n 'copilot' build/.moduleignore
 
-      # ---- Install deps ----------------------------------------------------
-      - name: npm ci
+      # ---- Install dependencies ---------------------------------------------
+      # Use the same compiler/sysroot/libc++ setup as Microsoft's Linux pipeline.
+      # Do not force GCC 13: setup-env.sh configures Chromium's matching Clang and sysroot.
+      - name: npm ci (Linux, upstream toolchain)
+        if: runner.os == 'Linux'
         working-directory: vscode
+        env:
+          VSCODE_ARCH: x64
+          npm_config_arch: x64
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          source ./build/azure-pipelines/linux/setup-env.sh
+          node build/npm/preinstall.ts
+
           ok=0
           for attempt in 1 2; do
-            if npm ci; then ok=1; break; fi
+            if npm ci; then
+              ok=1
+              break
+            fi
             echo "::warning::npm ci failed (attempt ${attempt}/2), cleaning up and retrying..."
             rm -rf node_modules
             sleep 20
           done
           [[ "$ok" == "1" ]]
 
-      # ---- Compile + package the app (portable directory) -----------------
-      # Task names below are the ones present in VS Code 1.142 (see `gulp --tasks-simple`).
-      # If upstream renames one, gulp fails with "Task never defined" and this list needs updating.
+      - name: npm ci (Windows)
+        if: runner.os == 'Windows'
+        working-directory: vscode
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node build/npm/preinstall.ts
+          ok=0
+          for attempt in 1 2; do
+            if npm ci; then
+              ok=1
+              break
+            fi
+            echo "::warning::npm ci failed (attempt ${attempt}/2), cleaning up and retrying..."
+            rm -rf node_modules
+            sleep 20
+          done
+          [[ "$ok" == "1" ]]
+
+      # ---- Compile + package the app (portable directory) --------------------
       - name: Build VS Code
         working-directory: vscode
         env:
-          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when gulp downloads built-in extensions
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           npm run gulp -- core-ci
           npm run gulp -- compile-extensions-build
-          # must run after compile-extensions-build (which wipes .build/extensions)
+          # Must run after compile-extensions-build (which wipes .build/extensions).
           npm run gulp -- compile-copilot-extension-build
           for f in package.json sdk; do
             test -e ".build/extensions/copilot/node_modules/@github/copilot/$f" || {
@@ -254,6 +292,7 @@ jobs:
 
       - name: Verify the built product.json contains our customisations
         run: |
+          set -euo pipefail
           jq -e '
             .extensionsGallery.serviceUrl == "https://open-vsx.org/vscode/gallery"
             and .configurationDefaults["extensions.autoCheckUpdates"] == false
@@ -264,42 +303,91 @@ jobs:
             and .configurationDefaults["chat.disableAIFeatures"] == true
           ' "${OUT_DIR}/resources/app/product.json"
 
-      # ---- CLI / Remote Tunnels binary -------------------------------------
-      # The gulp *-min-ci task does not build the Rust CLI; upstream's pipeline builds it
-      # separately and drops it into bin/. Packaging (dpkg-shlibdeps for deb/rpm, the Inno
-      # installers on Windows) expects it to exist, so we build it here.
+      # ---- CLI / Remote Tunnels binary --------------------------------------
+      # Match upstream's glibc 2.28 sysroot and use prebuilt static OpenSSL.
+      # This prevents the CLI from pulling in host-only dependencies such as
+      # libssl3t64 and GLIBC symbols newer than the supported baseline.
       - name: Build CLI / tunnel binary (Linux)
         if: runner.os == 'Linux'
         working-directory: vscode/cli
         env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          SYSROOT_ARCH: amd64
           OPENSSL_STATIC: "1"
+          VSCODE_CLI_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
-          rustup target add "${{ matrix.rust_target }}"
-          cargo build --release --target "${{ matrix.rust_target }}"
+
+          npm pack @vscode/openssl-prebuilt@0.0.11
+          mkdir -p openssl
+          tar -xzf vscode-openssl-prebuilt-0.0.11.tgz --strip-components=1 -C openssl
+          export OPENSSL_LIB_DIR="$PWD/openssl/out/x64-linux/lib"
+          export OPENSSL_INCLUDE_DIR="$PWD/openssl/out/x64-linux/include"
+
+          export VSCODE_SYSROOT_DIR="$GITHUB_WORKSPACE/vscode/.build/sysroots"
+          node -e 'import { getVSCodeSysroot } from "../build/linux/debian/install-sysroot.ts"; (async () => { await getVSCodeSysroot(process.env["SYSROOT_ARCH"]); })()'
+
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/bin/x86_64-linux-gnu-gcc"
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--sysroot=$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/x86_64-linux-gnu/sysroot -C link-arg=-L$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/x86_64-linux-gnu/sysroot/usr/lib/x86_64-linux-gnu"
+          export CC_x86_64_unknown_linux_gnu="$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/bin/x86_64-linux-gnu-gcc --sysroot=$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/x86_64-linux-gnu/sysroot"
+          export PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu="$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/x86_64-linux-gnu/sysroot/usr/lib/x86_64-linux-gnu/pkgconfig:$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/x86_64-linux-gnu/sysroot/usr/share/pkgconfig"
+          export PKG_CONFIG_SYSROOT_DIR_x86_64_unknown_linux_gnu="$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/x86_64-linux-gnu/sysroot"
+          export OBJDUMP="$VSCODE_SYSROOT_DIR/x86_64-linux-gnu/x86_64-linux-gnu/bin/objdump"
+
+          rustup target add x86_64-unknown-linux-gnu
+          cargo build --release --target x86_64-unknown-linux-gnu --bin=code
+
+          # Enforce the same glibc 2.28 compatibility check used upstream.
+          glibc_version="2.28"
+          while IFS= read -r line; do
+            if [[ "$line" == *"GLIBC_"* ]]; then
+              version="$(echo "$line" | awk '{print $5}' | tr -d '()')"
+              version="${version#*_}"
+              if [[ "$(printf '%s\n%s' "$version" "$glibc_version" | sort -V | tail -n1)" == "$version" ]]; then
+                glibc_version="$version"
+              fi
+            fi
+          done < <("$OBJDUMP" -T "$PWD/target/x86_64-unknown-linux-gnu/release/code")
+          if [[ "$glibc_version" != "2.28" ]]; then
+            echo "::error::CLI requires GLIBC $glibc_version; expected no newer than 2.28"
+            exit 1
+          fi
+          echo "Maximum CLI GLIBC version: $glibc_version"
+
           TUNNEL_NAME="$(jq -r .tunnelApplicationName ../product.json)"
-          echo "Tunnel binary name: $TUNNEL_NAME"
-          install -m 755 "target/${{ matrix.rust_target }}/release/code" \
+          mkdir -p "$GITHUB_WORKSPACE/${OUT_DIR}/bin"
+          install -m 755 "target/x86_64-unknown-linux-gnu/release/code" \
             "$GITHUB_WORKSPACE/${OUT_DIR}/bin/${TUNNEL_NAME}"
           ls -l "$GITHUB_WORKSPACE/${OUT_DIR}/bin"
 
-      # NOTE: untested. If the Inno Setup step complains about the location of the file,
-      # or cargo fails on OpenSSL, see the notes in the chat (check cli/Cargo.toml and
-      # upstream's build/azure-pipelines/cli/ scripts).
       - name: Build CLI / tunnel binary (Windows)
         if: runner.os == 'Windows'
         working-directory: vscode/cli
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          OPENSSL_STATIC: "1"
+          VSCODE_CLI_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
-          rustup target add "${{ matrix.rust_target }}"
-          cargo build --release --target "${{ matrix.rust_target }}"
+
+          npm pack @vscode/openssl-prebuilt@0.0.11
+          mkdir -p openssl
+          tar -xzf vscode-openssl-prebuilt-0.0.11.tgz --strip-components=1 -C openssl
+          export OPENSSL_LIB_DIR="$PWD/openssl/out/x64-windows-static/lib"
+          export OPENSSL_INCLUDE_DIR="$PWD/openssl/out/x64-windows-static/include"
+
+          rustup target add x86_64-pc-windows-msvc
+          cargo build --release --target x86_64-pc-windows-msvc --bin=code
+
           TUNNEL_NAME="$(jq -r .tunnelApplicationName ../product.json)"
-          echo "Tunnel binary name: $TUNNEL_NAME"
-          cp "target/${{ matrix.rust_target }}/release/code.exe" \
+          mkdir -p "$GITHUB_WORKSPACE/${OUT_DIR}/bin"
+          cp "target/x86_64-pc-windows-msvc/release/code.exe" \
             "$GITHUB_WORKSPACE/${OUT_DIR}/bin/${TUNNEL_NAME}.exe"
           ls -l "$GITHUB_WORKSPACE/${OUT_DIR}/bin"
 
-      # ---- Linux packaging: tar.gz (portable), .deb, .rpm ------------------
+      # ---- Linux packaging: tar.gz (portable), .deb, .rpm -------------------
       - name: Package (Linux) - tar.gz, deb, rpm
         if: runner.os == 'Linux'
         working-directory: vscode
@@ -307,21 +395,21 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
-          # Portable archive
+          # Portable archive.
           tar --owner=0 --group=0 -czf "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-linux-x64.tar.gz" \
             -C "$GITHUB_WORKSPACE" "$OUT_DIR"
 
-          # Debian / Ubuntu installer
+          # Debian / Ubuntu installer.
           npm run gulp -- "vscode-linux-${VSCODE_ARCH}-prepare-deb"
           npm run gulp -- "vscode-linux-${VSCODE_ARCH}-build-deb"
 
-          # Fedora / RHEL / openSUSE installer
+          # Fedora / RHEL / openSUSE installer.
           npm run gulp -- "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
           npm run gulp -- "vscode-linux-${VSCODE_ARCH}-build-rpm"
 
           pick() {
             local f
-            f="$(find "$1" -type f -name "$2" | head -n1)"
+            f="$(find "$1" -type f -name "$2" -print -quit)"
             [[ -n "$f" ]] || { echo "::error::No $2 found under $1"; exit 1; }
             echo "$f"
           }
@@ -329,7 +417,7 @@ jobs:
           cp "$(pick .build/linux/rpm '*.rpm')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-linux-x64.rpm"
           ls -lh "$GITHUB_WORKSPACE/dist"
 
-      # ---- Windows packaging: zip (portable), system + user installers -----
+      # ---- Windows packaging: zip (portable), system + user installers ------
       - name: Package (Windows) - zip, system setup, user setup
         if: runner.os == 'Windows'
         working-directory: vscode
@@ -337,21 +425,20 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
-          # Installer prerequisites + Inno Setup installers
           npm run gulp -- "vscode-win32-${VSCODE_ARCH}-inno-updater"
           npm run gulp -- "vscode-win32-${VSCODE_ARCH}-system-setup"
           npm run gulp -- "vscode-win32-${VSCODE_ARCH}-user-setup"
 
           pick() {
             local f
-            f="$(find "$1" -type f -name "$2" | head -n1)"
+            f="$(find "$1" -type f -name "$2" -print -quit)"
             [[ -n "$f" ]] || { echo "::error::No $2 found under $1"; exit 1; }
             echo "$f"
           }
           cp "$(pick .build/win32-x64/system-setup '*.exe')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64-system-setup.exe"
-          cp "$(pick .build/win32-x64/user-setup '*.exe')"   "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64-user-setup.exe"
+          cp "$(pick .build/win32-x64/user-setup '*.exe')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64-user-setup.exe"
 
-          # Portable zip (create a "data" folder next to "Code - OSS.exe" to enable portable mode)
+          # Portable zip (create a "data" folder next to "Code - OSS.exe" for portable mode).
           cd "$GITHUB_WORKSPACE/$OUT_DIR"
           7z a -tzip -mx=5 -bd "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64.zip" ./*
           ls -lh "$GITHUB_WORKSPACE/dist"
@@ -386,6 +473,7 @@ jobs:
       - name: Generate checksums
         working-directory: dist
         run: |
+          set -euo pipefail
           sha256sum -- * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
