@@ -251,7 +251,7 @@ jobs:
             exit 1
           fi
 
-          git -c http.extraheader="$AUTH_HEADER" push "$FORK_URL" \
+          git -C "$WORK_DIR" -c http.extraheader="$AUTH_HEADER" push "$FORK_URL" \
             "refs/tags/${TAG}:refs/tags/${TAG}"
           echo "Mirrored ${TAG} (${ACTUAL_COMMIT}) and its full source history into ${GITHUB_REPOSITORY}."
 
