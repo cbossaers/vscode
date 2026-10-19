@@ -1,9 +1,9 @@
 name: Build VS Code (Windows + Linux)
 
 # Place this file at .github/workflows/build-vscode.yml in YOUR repo.
-# It checks microsoft/vscode for new stable tags, mirrors each selected release
-# tag and its complete source history into YOUR fork, then builds from that fork.
-# Custom product.json settings, Open VSX, and packaging fixes are applied at build time.
+# It clones microsoft/vscode at an upstream tag, patches product.json
+# (Open VSX marketplace + privacy-friendly defaults), builds, packages
+# and publishes a GitHub release tagged exactly like the upstream tag.
 
 on:
   schedule:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "Tag to build from your fork (blank = latest upstream stable tag; if upstream is unavailable, latest mirrored tag)"
+        description: "Upstream microsoft/vscode tag to build (blank = latest stable tag)"
         required: false
         type: string
       force:
@@ -32,18 +32,17 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Select a stable tag, compare it with the fork, and decide whether to build
+  # 1. Decide which upstream tag to build, and whether we already released it
   # ---------------------------------------------------------------------------
   prepare:
-    name: Resolve source tag
+    name: Resolve upstream tag
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       commit: ${{ steps.resolve.outputs.commit }}
-      should_sync: ${{ steps.resolve.outputs.should_sync }}
       should_build: ${{ steps.resolve.outputs.should_build }}
     steps:
-      - name: Resolve tag in upstream and fork; decide sync/build
+      - name: Resolve tag and check for an existing release
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,217 +50,42 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
-          FORK_URL="https://github.com/${GITHUB_REPOSITORY}.git"
-          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-
-          # Validate user-provided tags before inserting them into git refspecs.
-          validate_tag() {
-            [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-              echo "::error::Invalid tag '$1'. Expected a stable X.Y.Z tag such as 1.143.0."
-              exit 1
-            }
-          }
-
-          # Resolve lightweight and annotated tags to the commit they reference.
-          # Return an empty string when the tag does not exist or cannot be queried.
-          resolve_tag() {
-            local url="$1" tag="$2" authenticated="$3" refs
-            if [[ "$authenticated" == "true" ]]; then
-              refs="$(git -c http.extraheader="$AUTH_HEADER" ls-remote --tags "$url" \
-                "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>/dev/null)" || return 1
-            else
-              refs="$(git ls-remote --tags "$url" \
-                "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>/dev/null)" || return 1
-            fi
-            printf '%s\n' "$refs" | awk -v direct="refs/tags/${tag}" -v peeled="refs/tags/${tag}^{}" '
-              $2 == peeled { peeled_sha = $1 }
-              $2 == direct { direct_sha = $1 }
-              END {
-                if (peeled_sha != "") print peeled_sha
-                else if (direct_sha != "") print direct_sha
-              }
-            '
-          }
-
-          # The fork must be reachable with this workflow's token. Keep its tag
-          # list for offline fallback if microsoft/vscode cannot be queried.
-          if ! FORK_TAG_REFS="$(git -c http.extraheader="$AUTH_HEADER" \
-              ls-remote --tags --refs "$FORK_URL" 2>/dev/null)"; then
-            echo "::error::Could not read tags from $GITHUB_REPOSITORY using GITHUB_TOKEN."
-            exit 1
-          fi
-          FORK_TAGS="$(printf '%s\n' "$FORK_TAG_REFS" \
-            | awk '{print $2}' | sed 's#^refs/tags/##' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)"
-
-          NEEDS_SYNC=false
-          UPSTREAM_AVAILABLE=false
-          TAG=""
-          COMMIT=""
+          URL="https://github.com/${UPSTREAM_REPO}.git"
 
           if [[ -n "${INPUT_TAG:-}" ]]; then
-            TAG="$INPUT_TAG"
-            validate_tag "$TAG"
-
-            # Prefer the fork's source tag so manual builds continue to work even
-            # if upstream is unavailable. Only fetch upstream when the fork lacks it.
-            FORK_COMMIT="$(resolve_tag "$FORK_URL" "$TAG" true || true)"
-            if [[ -n "$FORK_COMMIT" ]]; then
-              COMMIT="$FORK_COMMIT"
-              echo "Using existing source tag ${TAG} from ${GITHUB_REPOSITORY}."
-            else
-              UPSTREAM_COMMIT="$(resolve_tag "$UPSTREAM_URL" "$TAG" false || true)"
-              if [[ -z "$UPSTREAM_COMMIT" ]]; then
-                echo "::error::Tag ${TAG} is not present in the fork and could not be resolved in ${UPSTREAM_REPO}."
-                exit 1
-              fi
-              COMMIT="$UPSTREAM_COMMIT"
-              NEEDS_SYNC=true
-              UPSTREAM_AVAILABLE=true
-            fi
+            TAG="${INPUT_TAG}"
           else
-            # Scheduled runs use the newest stable upstream tag when available.
-            # If upstream is inaccessible, fall back to the newest stable tag that
-            # has already been mirrored into the fork (useful for recovery builds).
-            if UPSTREAM_TAG_REFS="$(git ls-remote --tags --refs "$UPSTREAM_URL" 2>/dev/null)"; then
-              UPSTREAM_TAGS="$(printf '%s\n' "$UPSTREAM_TAG_REFS" \
-                | awk '{print $2}' | sed 's#^refs/tags/##' \
-                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)"
-              if [[ -n "$UPSTREAM_TAGS" ]]; then
-                UPSTREAM_AVAILABLE=true
-                TAG="$(printf '%s\n' "$UPSTREAM_TAGS" | tail -n1)"
-                UPSTREAM_COMMIT="$(resolve_tag "$UPSTREAM_URL" "$TAG" false || true)"
-                if [[ -n "$UPSTREAM_COMMIT" ]]; then
-                  FORK_COMMIT="$(resolve_tag "$FORK_URL" "$TAG" true || true)"
-                  if [[ -n "$FORK_COMMIT" ]]; then
-                    if [[ "$FORK_COMMIT" != "$UPSTREAM_COMMIT" ]]; then
-                      echo "::error::Tag ${TAG} exists in both upstream and fork but points to different commits. Refusing to overwrite an existing source tag."
-                      echo "Fork: ${FORK_COMMIT}; upstream: ${UPSTREAM_COMMIT}"
-                      exit 1
-                    fi
-                    COMMIT="$FORK_COMMIT"
-                  else
-                    COMMIT="$UPSTREAM_COMMIT"
-                    NEEDS_SYNC=true
-                  fi
-                fi
-              fi
-            fi
-
-            # If upstream is down/unavailable (or its tag listing could not be
-            # resolved), select the newest stable tag already stored in the fork.
-            if [[ -z "$TAG" || -z "$COMMIT" ]]; then
-              if [[ -z "$FORK_TAGS" ]]; then
-                echo "::error::Could not resolve an upstream stable tag and the fork contains no stable X.Y.Z tags for fallback."
-                exit 1
-              fi
-              TAG="$(printf '%s\n' "$FORK_TAGS" | tail -n1)"
-              COMMIT="$(resolve_tag "$FORK_URL" "$TAG" true || true)"
-              [[ -n "$COMMIT" ]] || {
-                echo "::error::Could not resolve fallback tag ${TAG} in ${GITHUB_REPOSITORY}."
-                exit 1
-              }
-              NEEDS_SYNC=false
-              echo "::warning::Upstream latest-tag lookup was unavailable; falling back to mirrored fork tag ${TAG}."
-            fi
+            # Newest plain X.Y.Z tag (ignores insiders / pre-release style tags).
+            TAG="$(git ls-remote --tags --refs "$URL" \
+              | awk '{print $2}' | sed 's#refs/tags/##' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
           fi
+          [[ -n "$TAG" ]] || { echo "::error::Could not determine upstream tag"; exit 1; }
 
-          validate_tag "$TAG"
-          [[ -n "$COMMIT" ]] || { echo "::error::Could not resolve commit for tag ${TAG}."; exit 1; }
+          # Resolve annotated tags to their commit when applicable.
+          COMMIT="$(git ls-remote --tags "$URL" "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -n1 | cut -f1)"
+          [[ -n "$COMMIT" ]] || { echo "::error::Tag ${TAG} not found in ${UPSTREAM_REPO}"; exit 1; }
 
           SHOULD_BUILD=true
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             if [[ "${FORCE:-false}" != "true" ]]; then
-              echo "Release ${TAG} already exists - build will be skipped (the tag will still be mirrored if needed)."
+              echo "Release ${TAG} already exists - nothing to do."
               SHOULD_BUILD=false
             fi
           fi
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "should_sync=${NEEDS_SYNC}" >> "$GITHUB_OUTPUT"
           echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
-          echo "Selected tag: ${TAG} (${COMMIT}); sync=${NEEDS_SYNC}; build=${SHOULD_BUILD}; upstream_available=${UPSTREAM_AVAILABLE}"
+          echo "Upstream tag: ${TAG} (${COMMIT}) -> build=${SHOULD_BUILD}"
 
   # ---------------------------------------------------------------------------
-  # 2. Mirror the full source history reachable from a new upstream release tag
-  #    into the fork. Do NOT replace the fork's default branch: it contains this
-  #    workflow. The mirrored tag provides a durable source snapshot for builds.
-  # ---------------------------------------------------------------------------
-  sync:
-    name: Mirror source tag into fork
-    needs: prepare
-    if: needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      TAG: ${{ needs.prepare.outputs.tag }}
-      EXPECTED_COMMIT: ${{ needs.prepare.outputs.commit }}
-    steps:
-      - name: No sync needed
-        if: needs.prepare.outputs.should_sync != 'true'
-        run: echo "Source tag $TAG is already present in the fork; no upstream sync needed."
-
-      - name: Fetch complete upstream tag history and push tag to fork
-        if: needs.prepare.outputs.should_sync == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
-          FORK_URL="https://github.com/${GITHUB_REPOSITORY}.git"
-          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          WORK_DIR="$(mktemp -d)"
-          trap 'rm -rf "$WORK_DIR"' EXIT
-
-          # Initialize a fresh, non-shallow repository. Fetching the tag without
-          # --depth mirrors its complete commit ancestry, not just a checkout tree.
-          git init -q "$WORK_DIR"
-          git -C "$WORK_DIR" remote add upstream "$UPSTREAM_URL"
-          git -C "$WORK_DIR" fetch --no-tags upstream \
-            "refs/tags/${TAG}:refs/tags/${TAG}"
-
-          ACTUAL_COMMIT="$(git -C "$WORK_DIR" rev-parse "refs/tags/${TAG}^{commit}")"
-          if [[ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]]; then
-            echo "::error::Upstream tag ${TAG} moved while the workflow was running. Expected ${EXPECTED_COMMIT}, fetched ${ACTUAL_COMMIT}."
-            exit 1
-          fi
-
-          # Be safe under concurrent/manual runs: never overwrite an existing
-          # tag if it points somewhere else.
-          EXISTING_REFS="$(git -c http.extraheader="$AUTH_HEADER" \
-            ls-remote --tags "$FORK_URL" "refs/tags/${TAG}" "refs/tags/${TAG}^{}" 2>/dev/null || true)"
-          EXISTING_COMMIT="$(printf '%s\n' "$EXISTING_REFS" | awk \
-            -v direct="refs/tags/${TAG}" -v peeled="refs/tags/${TAG}^{}" '
-              $2 == peeled { peeled_sha = $1 }
-              $2 == direct { direct_sha = $1 }
-              END {
-                if (peeled_sha != "") print peeled_sha
-                else if (direct_sha != "") print direct_sha
-              }
-            ')"
-          if [[ -n "$EXISTING_COMMIT" ]]; then
-            if [[ "$EXISTING_COMMIT" == "$EXPECTED_COMMIT" ]]; then
-              echo "Tag ${TAG} was mirrored by another run; no push needed."
-              exit 0
-            fi
-            echo "::error::Fork tag ${TAG} already exists at ${EXISTING_COMMIT}, not expected ${EXPECTED_COMMIT}. Refusing to overwrite it."
-            exit 1
-          fi
-
-          git -C "$WORK_DIR" -c http.extraheader="$AUTH_HEADER" push "$FORK_URL" \
-            "refs/tags/${TAG}:refs/tags/${TAG}"
-          echo "Mirrored ${TAG} (${ACTUAL_COMMIT}) and its full source history into ${GITHUB_REPOSITORY}."
-
-  # ---------------------------------------------------------------------------
-  # 3. Build + package on Linux and Windows, using the fork's mirrored source tag
+  # 2. Build + package on Linux and Windows
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.name }}
-    needs: [prepare, sync]
-    if: needs.prepare.outputs.should_build == 'true' && needs.sync.result == 'success'
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -292,10 +116,10 @@ jobs:
         if: runner.os == 'Windows'
         run: git config --system core.longpaths true
 
-      - name: Checkout mirrored VS Code source from this fork @ ${{ needs.prepare.outputs.tag }}
+      - name: Checkout upstream VS Code @ ${{ needs.prepare.outputs.tag }}
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.prepare.outputs.tag }}
           path: vscode
           fetch-depth: 1
@@ -742,12 +566,12 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # 4. Create the release (only when mirroring and every build job succeeded)
+  # 3. Create the release (only when every build job succeeded)
   # ---------------------------------------------------------------------------
   release:
     name: Publish release
-    needs: [prepare, sync, build]
-    if: needs.prepare.outputs.should_build == 'true' && needs.sync.result == 'success' && needs.build.result == 'success'
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -778,9 +602,7 @@ jobs:
           fail_on_unmatched_files: true
           files: dist/*
           body: |
-            Unofficial build of [`microsoft/vscode` ${{ needs.prepare.outputs.tag }}](https://github.com/microsoft/vscode/tree/${{ needs.prepare.outputs.tag }}) (upstream commit `${{ needs.prepare.outputs.commit }}`).
-
-            The release source tag and its complete commit ancestry are mirrored into this repository before the build, and the build checks out that local fork tag. This lets an existing mirrored version be rebuilt even if the upstream repository later becomes unavailable.
+            Unofficial build of upstream [`microsoft/vscode` ${{ needs.prepare.outputs.tag }}](https://github.com/microsoft/vscode/tree/${{ needs.prepare.outputs.tag }}) (commit `${{ needs.prepare.outputs.commit }}`).
 
             **Build-time changes**
             - Extension marketplace: [Open VSX](https://open-vsx.org)
