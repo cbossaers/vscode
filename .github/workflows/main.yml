@@ -183,6 +183,39 @@ jobs:
         with:
           arch: x64
 
+      # The job uses Bash on Windows. GitHub prepends Git's usr/bin to PATH for
+      # every Bash step, where its GNU link.exe can shadow Microsoft's linker.
+      # Pin Cargo to the actual MSVC linker instead of relying on PATH lookup.
+      - name: Pin Rust to the Microsoft linker (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcToolsDir = $env:VCToolsInstallDir
+          $linker = if ($vcToolsDir) { Join-Path $vcToolsDir 'bin\Hostx64\x64\link.exe' } else { $null }
+
+          if (-not $linker -or -not (Test-Path $linker)) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (-not (Test-Path $vswhere)) {
+              throw "Could not find vswhere.exe or VCToolsInstallDir; cannot locate the MSVC linker."
+            }
+            $installPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if (-not $installPath) {
+              throw "Could not find a Visual Studio installation with the x64 C++ tools."
+            }
+            $toolsRoot = Join-Path $installPath 'VC\Tools\MSVC'
+            $toolsDir = Get-ChildItem $toolsRoot -Directory | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+            if (-not $toolsDir) {
+              throw "No MSVC toolset directory found under $toolsRoot."
+            }
+            $linker = Join-Path $toolsDir.FullName 'bin\Hostx64\x64\link.exe'
+          }
+
+          if (-not (Test-Path $linker)) {
+            throw "MSVC linker not found at '$linker'."
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Pinned Rust MSVC linker: $linker"
+
       # ---- Customise product.json -------------------------------------------
       # Open VSX gallery and user-overridable privacy/update defaults.
       - name: Patch product.json (Open VSX + default settings)
