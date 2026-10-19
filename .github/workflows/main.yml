@@ -212,9 +212,17 @@ jobs:
           echo "--- patched product.json (relevant keys) ---"
           jq '{extensionsGallery, configurationDefaults}' product.json
 
-      # Keep upstream build/.moduleignore unchanged. VS Code 1.142 uses
-      # @github/copilot-sdk (including a platform-specific SDK runtime), not
-      # the older @github/copilot/sdk path.
+      # The from-source Copilot extension build is not identical to the prebuilt
+      # VSIX used by Microsoft's CI. The packaging task
+      # prepareBuiltInCopilotRipgrepShim still requires this runtime at
+      # extensions/copilot/node_modules/@github/copilot/sdk. Re-include the
+      # package metadata and SDK subtree after the broad ignore rule.
+      - name: Preserve Copilot SDK files for packaging
+        working-directory: vscode
+        run: |
+          set -euo pipefail
+          printf '\n!@github/copilot/package.json\n!@github/copilot/sdk/**\n' >> build/.moduleignore
+          tail -n 12 build/.moduleignore
 
       # ---- Install dependencies ---------------------------------------------
       # setup-env.sh runs build/*.ts helpers, which import packages from build/node_modules.
@@ -299,9 +307,8 @@ jobs:
           # Must run after compile-extensions-build (which wipes .build/extensions).
           npm run gulp -- compile-copilot-extension-build
 
-          # Validate the compiled extension itself. Do not assert the obsolete
-          # @github/copilot/sdk directory: VS Code 1.142's packaging rules use
-          # @github/copilot-sdk and select its platform runtime during packaging.
+          # Validate the source-built extension and the SDK directory required
+          # by prepareBuiltInCopilotRipgrepShim during product packaging.
           for f in package.json dist/extension.js; do
             test -f ".build/extensions/copilot/$f" || {
               echo "::error::.build/extensions/copilot/$f missing after compile-copilot-extension-build"
@@ -309,6 +316,12 @@ jobs:
               exit 1
             }
           done
+          sdk_dir=".build/extensions/copilot/node_modules/@github/copilot/sdk"
+          if [[ ! -d "$sdk_dir" ]]; then
+            echo "::error::$sdk_dir missing after compile-copilot-extension-build; check build/.moduleignore preservation rules"
+            find .build/extensions/copilot/node_modules/@github -maxdepth 5 -print 2>/dev/null | head -200 || true
+            exit 1
+          fi
 
           npm run gulp -- "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci"
 
