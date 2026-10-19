@@ -245,6 +245,51 @@ jobs:
           echo "--- patched product.json (relevant keys) ---"
           jq '{extensionsGallery, configurationDefaults}' product.json
 
+      # product.json is metadata; upstream VS Code does not automatically apply
+      # an arbitrary top-level `configurationDefaults` object from it. Wire that
+      # object into the configuration registry so it becomes the actual default
+      # values at runtime (while users can still override them in settings.json).
+      - name: Wire product.json defaults into VS Code configuration
+        working-directory: vscode
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          path = Path("src/vs/workbench/api/common/configurationExtensionPoint.ts")
+          source = path.read_text(encoding="utf-8")
+          marker = "// BEGIN custom product.json configuration defaults\n"
+          if marker in source:
+              raise SystemExit("Custom product defaults patch is already present; refusing to patch twice")
+
+          needle = "defaultConfigurationExtPoint.setHandler((extensions, { added, removed }) => {"
+          if source.count(needle) != 1:
+              raise SystemExit(
+                  f"Expected exactly one configuration extension-point anchor in {path}; "
+                  f"found {source.count(needle)}. Upstream source may have changed."
+              )
+
+          patch = "\n".join([
+              "// BEGIN custom product.json configuration defaults",
+              "// The product metadata is intentionally used as defaults, not as enforced policy.",
+              "const productConfigurationDefaults = (product as typeof product & { configurationDefaults?: Record<string, unknown> }).configurationDefaults;",
+              "if (productConfigurationDefaults && typeof productConfigurationDefaults === 'object') {",
+              "\tconfigurationRegistry.deltaConfiguration({",
+              "\t\taddedDefaults: [{",
+              "\t\t\toverrides: productConfigurationDefaults,",
+              "\t\t\tsource: { id: 'product', displayName: 'Product defaults' }",
+              "\t\t}]",
+              "\t});",
+              "}",
+              "// END custom product.json configuration defaults",
+              "",
+              ""
+          ])
+          source = source.replace(needle, patch + needle, 1)
+          path.write_text(source, encoding="utf-8")
+          print(f"Patched {path} to apply product.json configurationDefaults")
+          PYCODE
+
       # The from-source Copilot extension build is not identical to the prebuilt
       # VSIX used by Microsoft's CI. The packaging task
       # prepareBuiltInCopilotRipgrepShim still requires this runtime at
