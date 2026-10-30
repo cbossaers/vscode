@@ -1,5 +1,10 @@
 name: Build VS Code (Windows + Linux)
 
+# Place this file at .github/workflows/build-vscode.yml in YOUR repo.
+# Builds the current commit of this repository (your VS Code fork), patches
+# product.json (Open VSX marketplace + privacy-friendly defaults), builds,
+# packages, and publishes a GitHub release tagged with the current UTC date.
+
 on:
   schedule:
     - cron: "0 0 * * 4"
@@ -77,6 +82,12 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version-file: vscode/.nvmrc
+          # Cache npm's package downloads (not node_modules, which npm ci removes).
+          # Both lockfiles are included because the build workspace has its own npm ci.
+          cache: npm
+          cache-dependency-path: |
+            vscode/package-lock.json
+            vscode/build/package-lock.json
 
       - name: Setup Python (needed by node-gyp)
         uses: actions/setup-python@v7
@@ -108,12 +119,32 @@ jobs:
             fakeroot rpm dpkg-dev xz-utils libssl-dev curl
 
       # ---- Windows prerequisites --------------------------------------------
-      - name: Install MSVC Spectre-mitigated libraries (Windows)
+      - name: Install MSVC Spectre-mitigated libraries (Windows, only if missing)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-          $installPath = & "$installerDir\vswhere.exe" -latest -products * -property installationPath
+          $vswhere = Join-Path $installerDir 'vswhere.exe'
+          $requiredComponents = @(
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre",
+            "Microsoft.VisualStudio.Component.VC.ATL.Spectre",
+            "Microsoft.VisualStudio.Component.VC.ATLMFC.Spectre"
+          )
+
+          # GitHub-hosted images are recreated for each job. Avoid running the
+          # Visual Studio installer when the image already contains every component.
+          $queryArgs = @("-latest", "-products", "*") + @("-requires") + $requiredComponents + @("-property", "installationPath")
+          $installPath = & $vswhere @queryArgs
+          if ($installPath) {
+            Write-Host "All required MSVC Spectre components are already installed at: $installPath"
+            exit 0
+          }
+
+          $installPath = & $vswhere -latest -products * -property installationPath
+          if (-not $installPath) {
+            throw "Could not find a Visual Studio installation to add the required Spectre components."
+          }
+
           $vsArgs = @(
             "modify", "--installPath", "`"$installPath`"",
             "--add", "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre",
@@ -364,6 +395,19 @@ jobs:
             and .configurationDefaults["telemetry.telemetryLevel"] == "off"
             and .configurationDefaults["chat.disableAIFeatures"] == true
           ' "${OUT_DIR}/resources/app/product.json"
+
+      # ---- Cache Rust dependencies used by the CLI --------------------------
+      # Keep this cache separate per OS/target. The Cargo registry and Git sources
+      # are reusable, while compiled target output is intentionally not cached.
+      - name: Cache Cargo registry and Git dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ matrix.rust_target }}-${{ hashFiles('vscode/cli/**/Cargo.lock', 'vscode/cli/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.rust_target }}-
 
       # ---- CLI / Remote Tunnels binary --------------------------------------
       # Use the glibc 2.28 sysroot and use prebuilt static OpenSSL.
