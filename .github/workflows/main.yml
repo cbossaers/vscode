@@ -1,10 +1,5 @@
 name: Build VS Code (Windows + Linux)
 
-# Place this file at .github/workflows/build-vscode.yml in YOUR repo.
-# It clones microsoft/vscode at an upstream tag, patches product.json
-# (Open VSX marketplace + privacy-friendly defaults), builds, packages
-# and publishes a GitHub release tagged exactly like the upstream tag.
-
 on:
   schedule:
     - cron: "0 0 * * 4"
@@ -32,17 +27,26 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Decide which upstream tag to build, and whether we already released it
+  # 1. Resolve the source tag, mirror it into this fork, and check for a release
   # ---------------------------------------------------------------------------
   prepare:
-    name: Resolve upstream tag
+    name: Sync source tag to fork
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to push the mirrored upstream tag into this fork.
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       commit: ${{ steps.resolve.outputs.commit }}
       should_build: ${{ steps.resolve.outputs.should_build }}
     steps:
-      - name: Resolve tag and check for an existing release
+      # Establish an authenticated origin remote for tag lookups and pushes.
+      # Keep this shallow; the build job fetches only the selected source tag.
+      - name: Checkout this fork
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Resolve tag, mirror it into the fork, and check for an existing release
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,21 +54,64 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          URL="https://github.com/${UPSTREAM_REPO}.git"
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+          git remote add upstream "$UPSTREAM_URL"
+
+          # Query the fork remotely instead of fetching its entire tag/history
+          # set into this lightweight preparation job.
+          FORK_TAGS="$(git ls-remote --tags --refs origin 2>/dev/null \
+            | awk '{print $2}' | sed 's#refs/tags/##' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)"
 
           if [[ -n "${INPUT_TAG:-}" ]]; then
             TAG="${INPUT_TAG}"
           else
-            # Newest plain X.Y.Z tag (ignores insiders / pre-release style tags).
-            TAG="$(git ls-remote --tags --refs "$URL" \
+            # Prefer the newest plain X.Y.Z upstream tag. If upstream is gone
+            # or unreachable, use the newest stable tag already mirrored here.
+            UPSTREAM_TAGS="$(git ls-remote --tags --refs upstream 2>/dev/null \
               | awk '{print $2}' | sed 's#refs/tags/##' \
-              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)"
+            if [[ -n "$UPSTREAM_TAGS" ]]; then
+              TAG="$(printf '%s\n' "$UPSTREAM_TAGS" | tail -n1)"
+            else
+              TAG="$(printf '%s\n' "$FORK_TAGS" | tail -n1)"
+              echo "::notice::Upstream has no reachable stable tags; falling back to tags already mirrored here."
+            fi
           fi
-          [[ -n "$TAG" ]] || { echo "::error::Could not determine upstream tag"; exit 1; }
+          [[ -n "$TAG" ]] || { echo "::error::Could not determine a stable tag from upstream or this fork"; exit 1; }
+          git check-ref-format "refs/tags/${TAG}" || { echo "::error::Invalid tag name: ${TAG}"; exit 1; }
 
-          # Resolve annotated tags to their commit when applicable.
-          COMMIT="$(git ls-remote --tags "$URL" "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -n1 | cut -f1)"
-          [[ -n "$COMMIT" ]] || { echo "::error::Tag ${TAG} not found in ${UPSTREAM_REPO}"; exit 1; }
+          # Fetch upstream into a temporary namespace first. This avoids
+          # overwriting a same-named tag in the fork without checking it.
+          if git ls-remote --exit-code upstream "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git fetch --no-tags upstream "refs/tags/${TAG}:refs/upstream/tags/${TAG}"
+            UPSTREAM_COMMIT="$(git rev-parse "refs/upstream/tags/${TAG}^{commit}")"
+
+            if git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              git fetch --no-tags origin "refs/tags/${TAG}:refs/fork/tags/${TAG}"
+              FORK_COMMIT="$(git rev-parse "refs/fork/tags/${TAG}^{commit}")"
+              if [[ "$FORK_COMMIT" != "$UPSTREAM_COMMIT" ]]; then
+                echo "::error::Tag ${TAG} already exists in this fork at ${FORK_COMMIT}, but upstream points to ${UPSTREAM_COMMIT}. Refusing to overwrite it."
+                exit 1
+              fi
+            else
+              # Preserve the original annotated/lightweight tag object.
+              git update-ref "refs/tags/${TAG}" "$(git rev-parse "refs/upstream/tags/${TAG}")"
+              git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
+              echo "Mirrored ${UPSTREAM_REPO} tag ${TAG} (${UPSTREAM_COMMIT}) into ${GITHUB_REPOSITORY}."
+            fi
+            COMMIT="$UPSTREAM_COMMIT"
+          elif git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::Upstream tag ${TAG} is unavailable; using the copy already stored in this fork."
+            git fetch --no-tags origin "refs/tags/${TAG}:refs/fork/tags/${TAG}"
+            COMMIT="$(git rev-parse "refs/fork/tags/${TAG}^{commit}")"
+          else
+            echo "::error::Tag ${TAG} is neither available upstream nor present in this fork."
+            exit 1
+          fi
+
+          # COMMIT is resolved from the upstream tag we mirrored or the
+          # already-mirrored fork tag; builds check out that tag from the fork.
 
           SHOULD_BUILD=true
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -77,7 +124,7 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
           echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
-          echo "Upstream tag: ${TAG} (${COMMIT}) -> build=${SHOULD_BUILD}"
+          echo "Fork source tag: ${TAG} (${COMMIT}) -> build=${SHOULD_BUILD}"
 
   # ---------------------------------------------------------------------------
   # 2. Build + package on Linux and Windows
@@ -93,11 +140,11 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-24.04
+            os: ubuntu-26.04
             platform: linux
             rust_target: x86_64-unknown-linux-gnu
           - name: win32-x64
-            os: windows-2022
+            os: windows-2025
             platform: win32
             rust_target: x86_64-pc-windows-msvc
     defaults:
@@ -105,7 +152,7 @@ jobs:
         shell: bash
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
-      UPSTREAM_COMMIT: ${{ needs.prepare.outputs.commit }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
       VSCODE_ARCH: x64
       OUT_DIR: VSCode-${{ matrix.platform }}-x64
       NODE_OPTIONS: --max-old-space-size=8192
@@ -116,13 +163,24 @@ jobs:
         if: runner.os == 'Windows'
         run: git config --system core.longpaths true
 
-      - name: Checkout upstream VS Code @ ${{ needs.prepare.outputs.tag }}
+      - name: Checkout fork source @ ${{ needs.prepare.outputs.tag }}
         uses: actions/checkout@v7
         with:
-          repository: ${{ env.UPSTREAM_REPO }}
+          repository: ${{ github.repository }}
           ref: ${{ needs.prepare.outputs.tag }}
           path: vscode
           fetch-depth: 1
+
+      - name: Verify checked-out fork commit
+        working-directory: vscode
+        run: |
+          set -euo pipefail
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+          if [[ "$ACTUAL_COMMIT" != "$SOURCE_COMMIT" ]]; then
+            echo "::error::Fork tag ${TAG} resolved to ${ACTUAL_COMMIT}, expected ${SOURCE_COMMIT}."
+            exit 1
+          fi
+          echo "Building fork commit ${ACTUAL_COMMIT}."
 
       - name: Setup Node.js (version from upstream .nvmrc)
         uses: actions/setup-node@v7
@@ -602,7 +660,7 @@ jobs:
           fail_on_unmatched_files: true
           files: dist/*
           body: |
-            Unofficial build of upstream [`microsoft/vscode` ${{ needs.prepare.outputs.tag }}](https://github.com/microsoft/vscode/tree/${{ needs.prepare.outputs.tag }}) (commit `${{ needs.prepare.outputs.commit }}`).
+            Unofficial build of the VS Code source mirrored into [this repository at tag `${{ needs.prepare.outputs.tag }}`](${{ github.server_url }}/${{ github.repository }}/tree/${{ needs.prepare.outputs.tag }}) from `microsoft/vscode` (commit `${{ needs.prepare.outputs.commit }}`).
 
             **Build-time changes**
             - Extension marketplace: [Open VSX](https://open-vsx.org)
