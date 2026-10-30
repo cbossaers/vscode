@@ -1,8 +1,6 @@
 name: Build VS Code (Windows + Linux)
 
 on:
-  schedule:
-    - cron: "0 0 * * 4"
   workflow_dispatch:
 
 permissions:
@@ -14,19 +12,19 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Generate one date tag shared by both build jobs and the release job
+  # 1. Generate one date/time tag shared by both build jobs and the release job
   # ---------------------------------------------------------------------------
   metadata:
-    name: Generate release date
+    name: Generate release date and time
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.date.outputs.tag }}
     steps:
-      - name: Generate UTC date tag
+      - name: Generate UTC date/time tag
         id: date
         run: |
           set -euo pipefail
-          TAG="$(date -u +'%Y-%m-%d')"
+          TAG="$(date -u +'%Y-%m-%d_%H-%M-%S')"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Release tag: ${TAG}"
 
