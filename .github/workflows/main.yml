@@ -117,7 +117,7 @@ jobs:
         run: git config --system core.longpaths true
 
       - name: Checkout upstream VS Code @ ${{ needs.prepare.outputs.tag }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.prepare.outputs.tag }}
@@ -125,12 +125,12 @@ jobs:
           fetch-depth: 1
 
       - name: Setup Node.js (version from upstream .nvmrc)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: vscode/.nvmrc
 
       - name: Setup Python (needed by node-gyp)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -557,7 +557,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/dist"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.name }}
           path: dist/*
@@ -577,7 +577,7 @@ jobs:
       contents: write
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: dist-*
           path: dist
