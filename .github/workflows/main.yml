@@ -1,149 +1,41 @@
 name: Build VS Code (Windows + Linux)
 
-# Place this file at .github/workflows/build-vscode.yml in YOUR repo.
-# It mirrors the selected microsoft/vscode tag into YOUR fork, checks out
-# that tag from YOUR fork, patches product.json (Open VSX marketplace +
-# privacy-friendly defaults), builds, packages and publishes a GitHub release.
-
 on:
   schedule:
     - cron: "0 0 * * 4"
   workflow_dispatch:
-    inputs:
-      upstream_tag:
-        description: "Upstream microsoft/vscode tag to build (blank = latest stable tag)"
-        required: false
-        type: string
-      force:
-        description: "Rebuild even if a release for this tag already exists"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-vscode-${{ inputs.upstream_tag || 'latest' }}
+  group: build-vscode-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  UPSTREAM_REPO: microsoft/vscode
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Resolve the source tag, mirror it into this fork, and check for a release
+  # 1. Generate one date tag shared by both build jobs and the release job
   # ---------------------------------------------------------------------------
-  prepare:
-    name: Sync source tag to fork
+  metadata:
+    name: Generate release date
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Needed to push the mirrored upstream tag into this fork.
     outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      commit: ${{ steps.resolve.outputs.commit }}
-      should_build: ${{ steps.resolve.outputs.should_build }}
+      tag: ${{ steps.date.outputs.tag }}
     steps:
-      # Establish an authenticated origin remote for tag lookups and pushes.
-      # Keep this shallow; the build job fetches only the selected source tag.
-      # FORK_SYNC_TOKEN must be a fine-grained PAT scoped to this repository
-      # with Contents: read/write and Workflows: read/write. GITHUB_TOKEN cannot
-      # be granted the Workflows permission needed to push upstream commits
-      # that contain .github/workflows files.
-      - name: Checkout this fork (tag-sync credentials)
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-          token: ${{ secrets.FORK_SYNC_TOKEN }}
-          persist-credentials: true
-
-      - name: Resolve tag, mirror it into the fork, and check for an existing release
-        id: resolve
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_TAG: ${{ inputs.upstream_tag }}
-          FORCE: ${{ inputs.force }}
+      - name: Generate UTC date tag
+        id: date
         run: |
           set -euo pipefail
-          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
-          git remote add upstream "$UPSTREAM_URL"
-
-          # Query the fork remotely instead of fetching its entire tag/history
-          # set into this lightweight preparation job.
-          FORK_TAGS="$(git ls-remote --tags --refs origin 2>/dev/null \
-            | awk '{print $2}' | sed 's#refs/tags/##' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)"
-
-          if [[ -n "${INPUT_TAG:-}" ]]; then
-            TAG="${INPUT_TAG}"
-          else
-            # Prefer the newest plain X.Y.Z upstream tag. If upstream is gone
-            # or unreachable, use the newest stable tag already mirrored here.
-            UPSTREAM_TAGS="$(git ls-remote --tags --refs upstream 2>/dev/null \
-              | awk '{print $2}' | sed 's#refs/tags/##' \
-              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)"
-            if [[ -n "$UPSTREAM_TAGS" ]]; then
-              TAG="$(printf '%s\n' "$UPSTREAM_TAGS" | tail -n1)"
-            else
-              TAG="$(printf '%s\n' "$FORK_TAGS" | tail -n1)"
-              echo "::notice::Upstream has no reachable stable tags; falling back to tags already mirrored here."
-            fi
-          fi
-          [[ -n "$TAG" ]] || { echo "::error::Could not determine a stable tag from upstream or this fork"; exit 1; }
-          git check-ref-format "refs/tags/${TAG}" || { echo "::error::Invalid tag name: ${TAG}"; exit 1; }
-
-          # Fetch upstream into a temporary namespace first. This avoids
-          # overwriting a same-named tag in the fork without checking it.
-          if git ls-remote --exit-code upstream "refs/tags/${TAG}" >/dev/null 2>&1; then
-            git fetch --no-tags upstream "refs/tags/${TAG}:refs/upstream/tags/${TAG}"
-            UPSTREAM_COMMIT="$(git rev-parse "refs/upstream/tags/${TAG}^{commit}")"
-
-            if git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-              git fetch --no-tags origin "refs/tags/${TAG}:refs/fork/tags/${TAG}"
-              FORK_COMMIT="$(git rev-parse "refs/fork/tags/${TAG}^{commit}")"
-              if [[ "$FORK_COMMIT" != "$UPSTREAM_COMMIT" ]]; then
-                echo "::error::Tag ${TAG} already exists in this fork at ${FORK_COMMIT}, but upstream points to ${UPSTREAM_COMMIT}. Refusing to overwrite it."
-                exit 1
-              fi
-            else
-              # Preserve the original annotated/lightweight tag object.
-              git update-ref "refs/tags/${TAG}" "$(git rev-parse "refs/upstream/tags/${TAG}")"
-              git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
-              echo "Mirrored ${UPSTREAM_REPO} tag ${TAG} (${UPSTREAM_COMMIT}) into ${GITHUB_REPOSITORY}."
-            fi
-            COMMIT="$UPSTREAM_COMMIT"
-          elif git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::notice::Upstream tag ${TAG} is unavailable; using the copy already stored in this fork."
-            git fetch --no-tags origin "refs/tags/${TAG}:refs/fork/tags/${TAG}"
-            COMMIT="$(git rev-parse "refs/fork/tags/${TAG}^{commit}")"
-          else
-            echo "::error::Tag ${TAG} is neither available upstream nor present in this fork."
-            exit 1
-          fi
-
-          # COMMIT is resolved from the upstream tag we mirrored or the
-          # already-mirrored fork tag; builds check out that tag from the fork.
-
-          SHOULD_BUILD=true
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if [[ "${FORCE:-false}" != "true" ]]; then
-              echo "Release ${TAG} already exists - nothing to do."
-              SHOULD_BUILD=false
-            fi
-          fi
-
+          TAG="$(date -u +'%Y-%m-%d')"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
-          echo "Fork source tag: ${TAG} (${COMMIT}) -> build=${SHOULD_BUILD}"
+          echo "Release tag: ${TAG}"
 
   # ---------------------------------------------------------------------------
   # 2. Build + package on Linux and Windows
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.name }}
-    needs: prepare
-    if: needs.prepare.outputs.should_build == 'true'
+    needs: metadata
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -162,8 +54,7 @@ jobs:
       run:
         shell: bash
     env:
-      TAG: ${{ needs.prepare.outputs.tag }}
-      SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      TAG: ${{ needs.metadata.outputs.tag }}
       VSCODE_ARCH: x64
       OUT_DIR: VSCode-${{ matrix.platform }}-x64
       NODE_OPTIONS: --max-old-space-size=8192
@@ -174,26 +65,15 @@ jobs:
         if: runner.os == 'Windows'
         run: git config --system core.longpaths true
 
-      - name: Checkout fork source @ ${{ needs.prepare.outputs.tag }}
+      - name: Checkout this fork
         uses: actions/checkout@v7
         with:
           repository: ${{ github.repository }}
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ github.sha }}
           path: vscode
           fetch-depth: 1
 
-      - name: Verify checked-out fork commit
-        working-directory: vscode
-        run: |
-          set -euo pipefail
-          ACTUAL_COMMIT="$(git rev-parse HEAD)"
-          if [[ "$ACTUAL_COMMIT" != "$SOURCE_COMMIT" ]]; then
-            echo "::error::Fork tag ${TAG} resolved to ${ACTUAL_COMMIT}, expected ${SOURCE_COMMIT}."
-            exit 1
-          fi
-          echo "Building fork commit ${ACTUAL_COMMIT}."
-
-      - name: Setup Node.js (version from upstream .nvmrc)
+      - name: Setup Node.js (version from this fork's .nvmrc)
         uses: actions/setup-node@v7
         with:
           node-version-file: vscode/.nvmrc
@@ -211,7 +91,7 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      # ---- Linux prerequisites (from upstream CONTRIBUTING/build pipeline) ----
+      # ---- Linux prerequisites (from the VS Code build requirements) ----
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -314,7 +194,7 @@ jobs:
           echo "--- patched product.json (relevant keys) ---"
           jq '{extensionsGallery, configurationDefaults}' product.json
 
-      # product.json is metadata; upstream VS Code does not automatically apply
+      # product.json is metadata; VS Code does not automatically apply
       # an arbitrary top-level `configurationDefaults` object from it. Wire that
       # object into the configuration registry so it becomes the actual default
       # values at runtime (while users can still override them in settings.json).
@@ -335,7 +215,7 @@ jobs:
           if source.count(needle) != 1:
               raise SystemExit(
                   f"Expected exactly one configuration extension-point anchor in {path}; "
-                  f"found {source.count(needle)}. Upstream source may have changed."
+                  f"found {source.count(needle)}. The source may have changed."
               )
 
           patch = "\n".join([
@@ -373,7 +253,7 @@ jobs:
 
       # ---- Install dependencies ---------------------------------------------
       # setup-env.sh runs build/*.ts helpers, which import packages from build/node_modules.
-      # Upstream installs the build workspace dependencies before sourcing setup-env.sh.
+      # The build workspace dependencies must be installed before sourcing setup-env.sh.
       - name: Install build-script dependencies (Linux)
         if: runner.os == 'Linux'
         working-directory: vscode/build
@@ -395,7 +275,7 @@ jobs:
 
       # Use the same compiler/sysroot/libc++ setup as Microsoft's Linux pipeline.
       # Do not force GCC 13: setup-env.sh configures Chromium's matching Clang and sysroot.
-      - name: npm ci (Linux, upstream toolchain)
+      - name: npm ci (Linux, VS Code toolchain)
         if: runner.os == 'Linux'
         working-directory: vscode
         env:
@@ -486,7 +366,7 @@ jobs:
           ' "${OUT_DIR}/resources/app/product.json"
 
       # ---- CLI / Remote Tunnels binary --------------------------------------
-      # Match upstream's glibc 2.28 sysroot and use prebuilt static OpenSSL.
+      # Use the glibc 2.28 sysroot and use prebuilt static OpenSSL.
       # This prevents the CLI from pulling in host-only dependencies such as
       # libssl3t64 and GLIBC symbols newer than the supported baseline.
       - name: Build CLI / tunnel binary (Linux)
@@ -497,7 +377,6 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           SYSROOT_ARCH: amd64
           OPENSSL_STATIC: "1"
-          VSCODE_CLI_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
 
@@ -520,7 +399,7 @@ jobs:
           rustup target add x86_64-unknown-linux-gnu
           cargo build --release --target x86_64-unknown-linux-gnu --bin=code
 
-          # Enforce the same glibc 2.28 compatibility check used upstream.
+          # Enforce the same glibc 2.28 compatibility check used by the VS Code build.
           glibc_version="2.28"
           while IFS= read -r line; do
             if [[ "$line" == *"GLIBC_"* ]]; then
@@ -550,7 +429,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           OPENSSL_STATIC: "1"
-          VSCODE_CLI_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
 
@@ -639,8 +517,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Publish release
-    needs: [prepare, build]
-    if: needs.prepare.outputs.should_build == 'true' && needs.build.result == 'success'
+    needs: [metadata, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -662,16 +539,16 @@ jobs:
       - name: Create / update GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
+          tag_name: ${{ needs.metadata.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Code - OSS ${{ needs.prepare.outputs.tag }}
+          name: Code - OSS ${{ needs.metadata.outputs.tag }}
           draft: false
           prerelease: false
           make_latest: "true"
           fail_on_unmatched_files: true
           files: dist/*
           body: |
-            Unofficial build of the VS Code source mirrored into [this repository at tag `${{ needs.prepare.outputs.tag }}`](${{ github.server_url }}/${{ github.repository }}/tree/${{ needs.prepare.outputs.tag }}) from `microsoft/vscode` (commit `${{ needs.prepare.outputs.commit }}`).
+            Build of `${{ github.repository }}` at commit `${{ github.sha }}` (ref `${{ github.ref_name }}`).
 
             **Build-time changes**
             - Extension marketplace: [Open VSX](https://open-vsx.org)
