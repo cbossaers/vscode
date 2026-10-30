@@ -1,5 +1,10 @@
 name: Build VS Code (Windows + Linux)
 
+# Place this file at .github/workflows/build-vscode.yml in YOUR repo.
+# It mirrors the selected microsoft/vscode tag into YOUR fork, checks out
+# that tag from YOUR fork, patches product.json (Open VSX marketplace +
+# privacy-friendly defaults), builds, packages and publishes a GitHub release.
+
 on:
   schedule:
     - cron: "0 0 * * 4"
@@ -41,10 +46,16 @@ jobs:
     steps:
       # Establish an authenticated origin remote for tag lookups and pushes.
       # Keep this shallow; the build job fetches only the selected source tag.
-      - name: Checkout this fork
+      # FORK_SYNC_TOKEN must be a fine-grained PAT scoped to this repository
+      # with Contents: read/write and Workflows: read/write. GITHUB_TOKEN cannot
+      # be granted the Workflows permission needed to push upstream commits
+      # that contain .github/workflows files.
+      - name: Checkout this fork (tag-sync credentials)
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+          persist-credentials: true
 
       - name: Resolve tag, mirror it into the fork, and check for an existing release
         id: resolve
@@ -140,11 +151,11 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-26.04
+            os: ubuntu-24.04
             platform: linux
             rust_target: x86_64-unknown-linux-gnu
           - name: win32-x64
-            os: windows-2025
+            os: windows-2022
             platform: win32
             rust_target: x86_64-pc-windows-msvc
     defaults:
