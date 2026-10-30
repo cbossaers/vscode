@@ -1,10 +1,5 @@
 name: Build VS Code (Windows + Linux)
 
-# Place this file at .github/workflows/build-vscode.yml in YOUR repo.
-# Builds the current commit of this repository (your VS Code fork), patches
-# product.json (Open VSX marketplace + privacy-friendly defaults), builds,
-# packages, and publishes a GitHub release tagged with the current UTC date.
-
 on:
   schedule:
     - cron: "0 0 * * 4"
@@ -101,13 +96,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
-
-      # ---- Linux prerequisites (from the VS Code build requirements) ----
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h /
 
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
@@ -400,7 +388,7 @@ jobs:
       # Keep this cache separate per OS/target. The Cargo registry and Git sources
       # are reusable, while compiled target output is intentionally not cached.
       - name: Cache Cargo registry and Git dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -531,7 +519,6 @@ jobs:
 
           npm run gulp -- "vscode-win32-${VSCODE_ARCH}-inno-updater"
           npm run gulp -- "vscode-win32-${VSCODE_ARCH}-system-setup"
-          npm run gulp -- "vscode-win32-${VSCODE_ARCH}-user-setup"
 
           pick() {
             local f
@@ -540,7 +527,6 @@ jobs:
             echo "$f"
           }
           cp "$(pick .build/win32-x64/system-setup '*.exe')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64-system-setup.exe"
-          cp "$(pick .build/win32-x64/user-setup '*.exe')" "$GITHUB_WORKSPACE/dist/code-oss-${TAG}-win32-x64-user-setup.exe"
 
           # Portable zip (create a "data" folder next to "Code - OSS.exe" for portable mode).
           cd "$GITHUB_WORKSPACE/$OUT_DIR"
@@ -581,7 +567,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Create / update GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}
           target_commitish: ${{ github.sha }}
@@ -603,7 +589,7 @@ jobs:
             **Downloads**
             | Platform | Installer | Portable |
             |---|---|---|
-            | Windows x64 | `*-win32-x64-system-setup.exe`, `*-win32-x64-user-setup.exe` | `*-win32-x64.zip` (add a `data` folder next to `Code - OSS.exe` for portable mode) |
+            | Windows x64 | `*-win32-x64-system-setup.exe` | `*-win32-x64.zip` (add a `data` folder next to `Code - OSS.exe` for portable mode) |
             | Debian / Ubuntu | `*-linux-x64.deb` | `*-linux-x64.tar.gz` |
             | Fedora / RHEL / openSUSE | `*-linux-x64.rpm` | `*-linux-x64.tar.gz` |
 
