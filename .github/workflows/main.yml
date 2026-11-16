@@ -1,6 +1,9 @@
 name: Build VS Code (Windows + Linux)
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
