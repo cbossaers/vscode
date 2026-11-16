@@ -74,16 +74,22 @@ jobs:
           path: vscode
           fetch-depth: 1
 
+      - name: Setup pnpm (version pinned by this fork)
+        uses: pnpm/action-setup@v6
+        with:
+          # Read packageManager from the checked-out fork's package.json.
+          package_json_file: vscode/package.json
+
       - name: Setup Node.js (version from this fork's .nvmrc)
         uses: actions/setup-node@v7
         with:
           node-version-file: vscode/.nvmrc
-          # Cache npm's package downloads (not node_modules, which npm ci removes).
-          # Both lockfiles are included because the build workspace has its own npm ci.
-          cache: npm
+          # Cache pnpm's package store (not node_modules).
+          # The main workspace and build tooling have separate lockfiles.
+          cache: pnpm
           cache-dependency-path: |
-            vscode/package-lock.json
-            vscode/build/package-lock.json
+            vscode/pnpm-lock.yaml
+            vscode/build/pnpm-lock.yaml
 
       - name: Setup Python (needed by node-gyp)
         uses: actions/setup-python@v7
@@ -274,7 +280,7 @@ jobs:
       # ---- Install dependencies ---------------------------------------------
       # setup-env.sh runs build/*.ts helpers, which import packages from build/node_modules.
       # The build workspace dependencies must be installed before sourcing setup-env.sh.
-      - name: Install build-script dependencies (Linux)
+      - name: pnpm install (build-script dependencies, Linux)
         if: runner.os == 'Linux'
         working-directory: vscode/build
         env:
@@ -283,11 +289,11 @@ jobs:
           set -euo pipefail
           ok=0
           for attempt in 1 2; do
-            if npm ci; then
+            if pnpm install --frozen-lockfile; then
               ok=1
               break
             fi
-            echo "::warning::build npm ci failed (attempt ${attempt}/2), cleaning up and retrying..."
+            echo "::warning::build pnpm install failed (attempt ${attempt}/2), cleaning up and retrying..."
             rm -rf node_modules
             sleep 20
           done
@@ -295,7 +301,7 @@ jobs:
 
       # Use the same compiler/sysroot/libc++ setup as Microsoft's Linux pipeline.
       # Do not force GCC 13: setup-env.sh configures Chromium's matching Clang and sysroot.
-      - name: npm ci (Linux, VS Code toolchain)
+      - name: pnpm install (Linux, VS Code toolchain)
         if: runner.os == 'Linux'
         working-directory: vscode
         env:
@@ -311,17 +317,17 @@ jobs:
 
           ok=0
           for attempt in 1 2; do
-            if npm ci; then
+            if pnpm install --frozen-lockfile; then
               ok=1
               break
             fi
-            echo "::warning::npm ci failed (attempt ${attempt}/2), cleaning up and retrying..."
+            echo "::warning::pnpm install failed (attempt ${attempt}/2), cleaning up and retrying..."
             rm -rf node_modules
             sleep 20
           done
           [[ "$ok" == "1" ]]
 
-      - name: npm ci (Windows)
+      - name: pnpm install (Windows)
         if: runner.os == 'Windows'
         working-directory: vscode
         env:
@@ -332,11 +338,11 @@ jobs:
           node build/npm/preinstall.ts
           ok=0
           for attempt in 1 2; do
-            if npm ci; then
+            if pnpm install --frozen-lockfile; then
               ok=1
               break
             fi
-            echo "::warning::npm ci failed (attempt ${attempt}/2), cleaning up and retrying..."
+            echo "::warning::pnpm install failed (attempt ${attempt}/2), cleaning up and retrying..."
             rm -rf node_modules
             sleep 20
           done
@@ -349,10 +355,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          npm run gulp -- core-ci
-          npm run gulp -- compile-extensions-build
+          pnpm run gulp core-ci
+          pnpm run gulp compile-extensions-build
           # Must run after compile-extensions-build (which wipes .build/extensions).
-          npm run gulp -- compile-copilot-extension-build
+          pnpm run gulp compile-copilot-extension-build
 
           # Validate the source-built extension and the SDK directory required
           # by prepareBuiltInCopilotRipgrepShim during product packaging.
@@ -370,7 +376,7 @@ jobs:
             exit 1
           fi
 
-          npm run gulp -- "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci"
+          pnpm run gulp "vscode-${{ matrix.platform }}-${VSCODE_ARCH}-min-ci"
 
       - name: Verify the built product.json contains our customisations
         run: |
@@ -493,12 +499,12 @@ jobs:
             -C "$GITHUB_WORKSPACE" "$OUT_DIR"
 
           # Debian / Ubuntu installer.
-          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-prepare-deb"
-          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-build-deb"
+          pnpm run gulp "vscode-linux-${VSCODE_ARCH}-prepare-deb"
+          pnpm run gulp "vscode-linux-${VSCODE_ARCH}-build-deb"
 
           # Fedora / RHEL / openSUSE installer.
-          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
-          npm run gulp -- "vscode-linux-${VSCODE_ARCH}-build-rpm"
+          pnpm run gulp "vscode-linux-${VSCODE_ARCH}-prepare-rpm"
+          pnpm run gulp "vscode-linux-${VSCODE_ARCH}-build-rpm"
 
           pick() {
             local f
@@ -518,8 +524,8 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
-          npm run gulp -- "vscode-win32-${VSCODE_ARCH}-inno-updater"
-          npm run gulp -- "vscode-win32-${VSCODE_ARCH}-system-setup"
+          pnpm run gulp "vscode-win32-${VSCODE_ARCH}-inno-updater"
+          pnpm run gulp "vscode-win32-${VSCODE_ARCH}-system-setup"
 
           pick() {
             local f
