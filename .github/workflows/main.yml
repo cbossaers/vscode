@@ -313,7 +313,7 @@ jobs:
         run: |
           set -euo pipefail
           source ./build/azure-pipelines/linux/setup-env.sh
-          node build/npm/preinstall.ts
+          pnpm run preinstall
 
           ok=0
           for attempt in 1 2; do
@@ -335,7 +335,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          node build/npm/preinstall.ts
+          pnpm run preinstall
           ok=0
           for attempt in 1 2; do
             if pnpm install --frozen-lockfile; then
