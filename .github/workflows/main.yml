@@ -58,7 +58,8 @@ jobs:
       TAG: ${{ needs.metadata.outputs.tag }}
       VSCODE_ARCH: x64
       OUT_DIR: VSCode-${{ matrix.platform }}-x64
-      NODE_OPTIONS: --max-old-space-size=8192
+      # Avoid a global 8 GB Node heap: package.json already sets 8 GB for Gulp.
+      # Keeping this unset prevents pnpm and helper processes inheriting that cap.
       NPM_CONFIG_LOGLEVEL: error
 
     steps:
@@ -277,6 +278,19 @@ jobs:
           printf '\n!@github/copilot/package.json\n!@github/copilot/sdk/**\n' >> build/.moduleignore
           tail -n 12 build/.moduleignore
 
+      - name: Report Linux runner resources
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          echo "--- CPU ---"
+          nproc
+          echo "--- Memory ---"
+          free -h
+          echo "--- Filesystem capacity ---"
+          df -hT / "$GITHUB_WORKSPACE"
+          echo "--- Largest processes ---"
+          ps -eo pid,ppid,rss,%mem,%cpu,comm --sort=-rss | sed -n '1,15p'
+
       # ---- Install dependencies ---------------------------------------------
       # setup-env.sh runs build/*.ts helpers, which import packages from build/node_modules.
       # The build workspace dependencies must be installed before sourcing setup-env.sh.
@@ -289,7 +303,7 @@ jobs:
           set -euo pipefail
           ok=0
           for attempt in 1 2; do
-            if pnpm install --frozen-lockfile; then
+            if pnpm install --frozen-lockfile --network-concurrency=4 --child-concurrency=2; then
               ok=1
               break
             fi
@@ -317,7 +331,7 @@ jobs:
 
           ok=0
           for attempt in 1 2; do
-            if pnpm install --frozen-lockfile; then
+            if pnpm install --frozen-lockfile --network-concurrency=4 --child-concurrency=2; then
               ok=1
               break
             fi
@@ -355,6 +369,23 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # Emit periodic resource snapshots. If the runner is killed, the last
+          # snapshots help distinguish RAM pressure from disk exhaustion.
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            (
+              while true; do
+                echo "--- Linux resources at $(date -Is) ---"
+                free -h
+                df -hT / "$GITHUB_WORKSPACE"
+                ps -eo pid,ppid,rss,%mem,%cpu,comm --sort=-rss | sed -n '1,12p'
+                sleep 60
+              done
+            ) &
+            RESOURCE_MONITOR_PID=$!
+            trap 'kill "$RESOURCE_MONITOR_PID" 2>/dev/null || true; wait "$RESOURCE_MONITOR_PID" 2>/dev/null || true' EXIT
+          fi
+
           pnpm run gulp core-ci
           pnpm run gulp compile-extensions-build
           # Must run after compile-extensions-build (which wipes .build/extensions).
@@ -418,6 +449,21 @@ jobs:
           OPENSSL_STATIC: "1"
         run: |
           set -euo pipefail
+
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            (
+              while true; do
+                echo "--- Linux resources at $(date -Is) ---"
+                free -h
+                df -hT / "$GITHUB_WORKSPACE"
+                ps -eo pid,ppid,rss,%mem,%cpu,comm --sort=-rss | sed -n '1,12p'
+                sleep 60
+              done
+            ) &
+            RESOURCE_MONITOR_PID=$!
+            trap 'kill "$RESOURCE_MONITOR_PID" 2>/dev/null || true; wait "$RESOURCE_MONITOR_PID" 2>/dev/null || true' EXIT
+          fi
+
 
           npm pack @vscode/openssl-prebuilt@0.0.11
           mkdir -p openssl
@@ -492,6 +538,21 @@ jobs:
         working-directory: vscode
         run: |
           set -euo pipefail
+
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            (
+              while true; do
+                echo "--- Linux resources at $(date -Is) ---"
+                free -h
+                df -hT / "$GITHUB_WORKSPACE"
+                ps -eo pid,ppid,rss,%mem,%cpu,comm --sort=-rss | sed -n '1,12p'
+                sleep 60
+              done
+            ) &
+            RESOURCE_MONITOR_PID=$!
+            trap 'kill "$RESOURCE_MONITOR_PID" 2>/dev/null || true; wait "$RESOURCE_MONITOR_PID" 2>/dev/null || true' EXIT
+          fi
+
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
           # Portable archive.
