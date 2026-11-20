@@ -362,6 +362,52 @@ jobs:
           done
           [[ "$ok" == "1" ]]
 
+      # The upstream core-ci task runs the desktop, server, and server-web
+      # production bundles in parallel. On this Linux runner that peaks at
+      # nearly all available RAM, so serialize only those three bundle tasks.
+      # Keep Windows on the upstream parallel behavior.
+      - name: Serialize core esbuild bundles (Linux memory workaround)
+        if: runner.os == 'Linux'
+        working-directory: vscode
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          path = Path("build/gulpfile.vscode.ts")
+          source = path.read_text(encoding="utf-8")
+          start_marker = "task.task(task.define('core-ci', task.series("
+          start = source.find(start_marker)
+          if start < 0:
+              raise SystemExit(f"Could not find core-ci task in {path}; refusing to patch")
+
+          end = source.find("\n/**", start)
+          if end < 0:
+              raise SystemExit(f"Could not find end of core-ci task in {path}; refusing to patch")
+
+          block = source[start:end]
+          targets = (
+              "esbuild-vscode-min",
+              "esbuild-vscode-reh-min",
+              "esbuild-vscode-reh-web-min",
+          )
+          if any(block.count(name) != 1 for name in targets):
+              raise SystemExit("Expected the three known core-ci esbuild targets exactly once; refusing to patch")
+
+          if "task.parallel(" not in block:
+              if "task.series(" in block and all(block.count(name) == 1 for name in targets):
+                  print("Core esbuild bundles are already serialized; no change needed")
+                  raise SystemExit(0)
+              raise SystemExit("Could not find the expected task.parallel() in core-ci; refusing to patch")
+
+          if block.count("task.parallel(") != 1:
+              raise SystemExit("Expected exactly one task.parallel() in core-ci; refusing to patch")
+
+          patched_block = block.replace("task.parallel(", "task.series(", 1)
+          path.write_text(source[:start] + patched_block + source[end:], encoding="utf-8")
+          print("Changed core-ci's three production bundles from parallel to sequential execution")
+          PYCODE
+
       # ---- Compile + package the app (portable directory) --------------------
       - name: Build VS Code
         working-directory: vscode
